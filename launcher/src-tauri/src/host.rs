@@ -142,9 +142,36 @@ fn which(exe: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(exe)).find(|f| f.is_file()))
 }
 
-/// Steam's Proton, else umu-run, else Wine. Err names what to install.
+/// The GPU driver's shader caches, set up as Steam sets them up for a game it starts: a folder of the game's own that the
+/// driver never trims. The shared default (~/.cache/nvidia, ~/.cache/mesa_shader_cache) is trimmed to a size limit by every
+/// program using it, and pipelines trimmed away are compiled again at the draw (20-40 ms each). A variable already set wins.
+#[cfg(not(windows))]
+fn shader_cache_env() -> Vec<(&'static str, OsString)> {
+    let dir = data_dir().join("shadercache");
+    let (nvidia, mesa) = (dir.join("nvidia"), dir.join("mesa"));
+    let _ = std::fs::create_dir_all(&nvidia);
+    let _ = std::fs::create_dir_all(&mesa);
+    [
+        ("__GL_SHADER_DISK_CACHE_PATH", nvidia.into_os_string()),
+        ("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1".into()),
+        ("MESA_SHADER_CACHE_DIR", mesa.into_os_string()),
+        ("MESA_SHADER_CACHE_MAX_SIZE", "10G".into()),
+    ]
+    .into_iter()
+    .filter(|(k, _)| std::env::var_os(k).is_none())
+    .collect()
+}
+
+/// Steam's Proton, else umu-run, else Wine, each with `shader_cache_env`. Err names what to install.
 #[cfg(not(windows))]
 pub fn runner() -> Result<Runner, String> {
+    let mut r = find_runner()?;
+    r.env.extend(shader_cache_env());
+    Ok(r)
+}
+
+#[cfg(not(windows))]
+fn find_runner() -> Result<Runner, String> {
     if let Some(r) = steam_proton() {
         return Ok(r);
     }
