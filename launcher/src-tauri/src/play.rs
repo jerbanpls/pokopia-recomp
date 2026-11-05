@@ -81,21 +81,13 @@ pub fn start(app: &AppHandle, game_dir: &Path, minimize: bool) -> Result<(), Str
             Err(e) => format!(" Shaders were not prepared: {}.", e),
             _ => String::new(),
         };
-        // Linux: through Proton (host.rs)
-        let mut cmd = match crate::host::windows_program(&exe) {
+        let mut cmd = match game_command(&exe, &dir) {
             Ok(c) => c,
             Err(e) => {
                 set_status(&app2, Status { state: "exited".into(), crashed: true, message: format!("Could not start pkp.exe: {}", e), ..Default::default() });
                 return;
             }
         };
-        // every path (exefs, romfs, shader cache) comes from pkp.ini next to pkp.exe
-        cmd.current_dir(&dir).args(["--log", "pkp.log"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no stray console if pkp.exe is a console build
-        }
         let started = SystemTime::now();
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -140,6 +132,52 @@ pub fn start(app: &AppHandle, game_dir: &Path, minimize: bool) -> Result<(), Str
         }
     });
     Ok(())
+}
+
+/// How Play starts pkp.exe: in its folder, through Proton on Linux (host.rs). Every path (exefs, romfs, shader cache) comes
+/// from pkp.ini next to it.
+fn game_command(exe: &Path, dir: &Path) -> Result<std::process::Command, String> {
+    let mut cmd = crate::host::windows_program(exe)?;
+    cmd.current_dir(dir).args(["--log", "pkp.log"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no stray console if pkp.exe is a console build
+    }
+    Ok(cmd)
+}
+
+/// `--play`: what Play does, without the window, for a shortcut that starts the game directly (Steam, Sunshine). Checks
+/// that setup finished, prepares the run-time shaders, runs pkp.exe until it exits, then translates the shaders it built.
+/// Returns the game's exit code (1 when it could not start).
+pub fn run_cli(game_dir: &Path, tools: &Path) -> i32 {
+    let fail = |m: String| {
+        eprintln!("{}", m);
+        1
+    };
+    let exe = game_dir.join("pkp.exe");
+    if !exe.is_file() || (crate::gamebuild::is_package_b(tools) && !crate::gamebuild::is_built(game_dir, tools)) {
+        return fail(format!("pkp.exe in {} is missing or from an older release: open the launcher and press Set up.", crate::dump::fwd(game_dir)));
+    }
+    if !crate::shaders::is_complete(game_dir) || !game_dir.join(crate::settings::PKP_INI).is_file() {
+        return fail("Setup has not finished: open the launcher and press Set up.".into());
+    }
+    match crate::shaders::prepare(game_dir, tools, &std::sync::atomic::AtomicBool::new(false)) {
+        Ok(Some(n)) if n > 0 => println!("{} shaders were translated before the start.", n),
+        Err(e) => eprintln!("Shaders were not prepared: {}.", e),
+        _ => {}
+    }
+    let status = game_command(&exe, game_dir).and_then(|mut c| c.status().map_err(|e| format!("Could not start pkp.exe: {}", e)));
+    let code = match status {
+        Ok(st) => st.code().unwrap_or(1),
+        Err(e) => return fail(e),
+    };
+    match crate::shaders::translate_missing(game_dir, tools) {
+        Ok(n) if n > 0 => println!("{} new shaders translated.", n),
+        Err(e) => eprintln!("New shaders were not translated: {}.", e),
+        _ => {}
+    }
+    code
 }
 
 pub fn open_with_shell(path: &Path) -> Result<(), String> {

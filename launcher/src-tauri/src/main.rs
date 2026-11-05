@@ -654,6 +654,14 @@ fn main() {
     if args.iter().any(|a| a == "--host") {
         std::process::exit(run_headless(&args));
     }
+    // `--play [--game <folder>]`: starts the game as Play does, without the window (a Steam or Sunshine shortcut). The game
+    // folder is the launcher's own unless given: the one set in Settings lives in the window's config, not read here.
+    if args.iter().any(|a| a == "--play") {
+        #[cfg(windows)]
+        win_console::attach_and_hook_ctrl_c();
+        let game = args.iter().position(|a| a == "--game").and_then(|i| args.get(i + 1)).map(PathBuf::from).unwrap_or_else(exe_dir);
+        std::process::exit(play::run_cli(&game, &exe_dir().join("tools")));
+    }
     // WebKitGTK's DMA-BUF renderer leaves the window blank or kills it ("Error 71 (Protocol error)") on NVIDIA's driver
     #[cfg(target_os = "linux")]
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() && Path::new("/sys/module/nvidia").exists() {

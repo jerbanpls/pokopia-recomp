@@ -83,6 +83,8 @@ release folder next to `tools\` as `PokopiaLauncher`. The game stays the Windows
   frame 5 s, in a 24-minute session; none with both off). On Linux `pool_mirror` there outranks the F1 page's "Faster GPU
   memory". The game also gets driver shader caches of its own that are never trimmed
   (`~/.local/share/pokopia-recomp/shadercache`), as Steam gives the games it starts.
+- `PokopiaLauncher --play [--game <folder>]` starts the game as Play does, without the window, and waits for it: for a
+  Steam or Sunshine shortcut (Sunshine `apps.json`: `"cmd": "<game folder>/PokopiaLauncher --play"`). It works on Windows too.
 - Building needs the webkit2gtk-4.1, gtk3 and libsoup3 development packages. On Bazzite, in a Fedora toolbox:
   `distrobox create -n pokopia-build -i registry.fedoraproject.org/fedora-toolbox:45`, then
   `sudo dnf install rust cargo nodejs npm gcc webkit2gtk4.1-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel`.
