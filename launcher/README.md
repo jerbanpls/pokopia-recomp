@@ -82,10 +82,12 @@ release folder next to `tools\` as `PokopiaLauncher`. The game stays the Windows
   `distrobox create -n pokopia-build -i registry.fedoraproject.org/fedora-toolbox:45`, then
   `sudo dnf install rust cargo nodejs npm gcc webkit2gtk4.1-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel`.
 
-Tested on Bazzite 45 (RTX 4070 Ti, Wayland): `cargo test` (also `cargo check --target x86_64-pc-windows-gnu --all-targets`), the
-window, the checks, the tool download, Proton detection, Link Play addresses, Eden save detection, `test_pkp_build.py`, and the
-Linux Zig compiling `pkp_stub.cpp` and linking a PE with `pkp.rc` and `pkp_rt.lib`. Not yet run end to end, for want of a 2.0.1
-(update 655360) dump with its base game: the game build, the shader translation under Proton, the hidden first run and Play.
+Tested on Bazzite 45 (Ryzen 9 9900X with 12 threads, 16 GB, RTX 4070 Ti, Wayland), end to end with a 2.0.1 (update 655360)
+dump: Set up built pkp.exe in 12 minutes (the 2 GiB-per-compile memory cap ran 3 of the 284 units at a time), translated the
+99,012 shaders in 17 minutes under Proton Experimental in the Steam Linux Runtime 4 (about 95 a second), and the hidden first run
+collected 212 run-time shaders; Play then ran the game. Also `cargo test`, `cargo check --target x86_64-pc-windows-gnu
+--all-targets`, `test_pkp_build.py`, Link Play addresses and Eden save detection. Not tried yet: Pause and Continue in the middle of
+the shader translation, the umu-run and Wine fallbacks, AMD GPUs and the Steam Deck, and the DLSS download.
 
 ## Development
 
