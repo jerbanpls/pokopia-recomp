@@ -1,4 +1,4 @@
-<h1 align="center">🏝️ Pokopia Recomp</h1>
+<h1 align="center">🏝️ Pokopia Recomp (Bazzite Fork)</h1>
 
 <p align="center">
   <b>Pokémon Pokopia (Switch 2) recompiled to run natively on Windows, with multiplayer support.</b>
