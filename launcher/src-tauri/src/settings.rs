@@ -130,6 +130,16 @@ pub fn ensure_play_paths(dir: &Path, exefs: &str, romfs: &str) -> Result<(), Str
         ini.set("nvn", "dump_missing", crate::shaders::MISSING_REL);
         changed = true;
     }
+    // Linux: nothing write-watches the game's memory. Under Proton the pools are mapped into the GPU driver, which maps them
+    // again after every write the page protection catches: 60-180 ms stalls with these on (kept if the user set them; on
+    // Linux pool_mirror here outranks the F1 page's "Faster GPU memory")
+    #[cfg(not(windows))]
+    for (key, value) in [("pool_mirror", "off"), ("tex_write_watch", "false")] {
+        if ini.get("nvn", key).is_none() {
+            ini.set("nvn", key, value);
+            changed = true;
+        }
+    }
     let cur_save = ini.get("fs", "save_dir").unwrap_or_default();
     if cur_save.trim().is_empty() {
         let _ = fs::create_dir_all(dir.join("save"));
@@ -172,6 +182,25 @@ mod tests {
         write_atomic(&dir.join(PKP_INI), &ini.to_text()).unwrap();
         ensure_play_paths(&dir, &d, &d).unwrap();
         assert_eq!(load(&dir.join(PKP_INI)).unwrap().get("nvn", "dump_missing").as_deref(), Some(""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_play_paths_turn_off_write_watching_once() {
+        let dir = std::env::temp_dir().join(format!("pkp_ww_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let d = crate::dump::fwd(&dir);
+        ensure_play_paths(&dir, &d, &d).unwrap();
+        let ini = load(&dir.join(PKP_INI)).unwrap();
+        assert_eq!((ini.get("nvn", "pool_mirror").as_deref(), ini.get("nvn", "tex_write_watch").as_deref()), (Some("off"), Some("false")));
+        // the user turned the mirror back on: kept
+        let mut ini = load(&dir.join(PKP_INI)).unwrap();
+        ini.set("nvn", "pool_mirror", "on");
+        write_atomic(&dir.join(PKP_INI), &ini.to_text()).unwrap();
+        ensure_play_paths(&dir, &d, &d).unwrap();
+        assert_eq!(load(&dir.join(PKP_INI)).unwrap().get("nvn", "pool_mirror").as_deref(), Some("on"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

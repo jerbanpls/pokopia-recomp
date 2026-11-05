@@ -78,6 +78,11 @@ release folder next to `tools\` as `PokopiaLauncher`. The game stays the Windows
   addresses from getifaddrs (Tailscale and ZeroTier as overlays, bridges and VPNs skipped); save import looks in
   `~/.local/share/eden` and `~/.config/Ryujinx`; files and links open with `xdg-open`. On NVIDIA the launcher sets
   `WEBKIT_DISABLE_DMABUF_RENDERER=1` (a blank window otherwise).
+- Speed: Set up writes `[nvn] pool_mirror = off` and `tex_write_watch = false` unless they are set. Their write-watching makes
+  the GPU driver map the game's memory again after each caught write under Proton (measured: 107 stalls of 60-180 ms, worst
+  frame 5 s, in a 24-minute session; none with both off). On Linux `pool_mirror` there outranks the F1 page's "Faster GPU
+  memory". The game also gets driver shader caches of its own that are never trimmed
+  (`~/.local/share/pokopia-recomp/shadercache`), as Steam gives the games it starts.
 - Building needs the webkit2gtk-4.1, gtk3 and libsoup3 development packages. On Bazzite, in a Fedora toolbox:
   `distrobox create -n pokopia-build -i registry.fedoraproject.org/fedora-toolbox:45`, then
   `sudo dnf install rust cargo nodejs npm gcc webkit2gtk4.1-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel`.
