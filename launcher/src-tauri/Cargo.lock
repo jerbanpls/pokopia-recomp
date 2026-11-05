@@ -2263,6 +2263,7 @@ dependencies = [
 name = "pokopia-launcher"
 version = "0.1.1"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "sha2",

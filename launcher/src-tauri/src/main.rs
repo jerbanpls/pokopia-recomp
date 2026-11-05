@@ -4,6 +4,7 @@
 mod dlss;
 mod dump;
 mod gamebuild;
+mod host;
 mod ini;
 mod lan;
 mod nup;
@@ -332,6 +333,16 @@ fn start_setup(app: AppHandle, state: State<Arc<SetupState>>, gentle: Option<boo
             let _ = app.emit("setup-status", p);
         };
         let result = (|| {
+            // Linux: the native Python and Zig that the build and the shader extractor run with, fetched once
+            let tools_ready = host::prepare_tools(&tools_dir, &st.cancel, &mut |done, total, message| {
+                emit(shaders::Progress { state: "running".into(), phase: "tools".into(), done, total, message })
+            })?;
+            if !tools_ready {
+                return Ok(false);
+            }
+            // Linux: the translator and the hidden run need Proton; say so now, not after the build
+            #[cfg(not(windows))]
+            log(&format!("Windows programs run with: {}", host::runner()?.label));
             // no build yet, or one from an older release (stale tools stamp): build pkp.exe (again)
             if package_b && !gamebuild::is_built(&build_job.game_dir, &tools_dir) {
                 let tools = gamebuild::find_tools(&tools_dir)?;
@@ -642,6 +653,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--host") {
         std::process::exit(run_headless(&args));
+    }
+    // WebKitGTK's DMA-BUF renderer leaves the window blank or kills it ("Error 71 (Protocol error)") on NVIDIA's driver
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() && Path::new("/sys/module/nvidia").exists() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

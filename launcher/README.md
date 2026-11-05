@@ -61,6 +61,32 @@ tools\
 If a file is missing, setup stops and names it. `pkp.exe` can live in another folder (Settings, game folder), but
 `tools\` always sits next to the launcher.
 
+## Linux (Bazzite, SteamOS, other distributions)
+
+The launcher also builds as a native Linux program (`npm run tauri build -- --no-bundle` on Linux). Tauri draws it with WebKitGTK
+there, so it needs no WebView2 (which Proton lacks: the Windows launcher does not start under Proton). Put the binary in the
+release folder next to `tools\` as `PokopiaLauncher`. The game stays the Windows pkp.exe; what differs is in `src-tauri/src/host.rs`:
+
+- The build tools run natively from `tools/linux/`. Set up first downloads Python 3.13 (python-build-standalone) with the lz4 and
+  capstone wheels, and Zig 0.17.0, each pinned by size and SHA-256. Off Windows `pkp_build.py` compiles with that Zig, reads free
+  memory from `/proc/meminfo` and starts its tools without the Windows creation flags.
+- The shader translator and pkp.exe (the hidden first run and Play) run through Proton: Steam's Proton Experimental, else the newest
+  Proton N.N, inside the Steam Linux Runtime as Steam starts a game, with its prefix in `~/.local/share/pokopia-recomp/proton`.
+  `PKP_PROTON=<folder>` picks another Proton build. Without Steam: `umu-run`, then `wine`. Paths handed to them are `Z:\...`.
+  Linux translates in chunks of 5000 (every run also starts Proton), and Pause kills the tool's whole process group.
+- The checks before Set up read statvfs, `/proc` and `libvulkan.so.1`, and Set up refuses to start without Proton. Link Play lists
+  addresses from getifaddrs (Tailscale and ZeroTier as overlays, bridges and VPNs skipped); save import looks in
+  `~/.local/share/eden` and `~/.config/Ryujinx`; files and links open with `xdg-open`. On NVIDIA the launcher sets
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` (a blank window otherwise).
+- Building needs the webkit2gtk-4.1, gtk3 and libsoup3 development packages. On Bazzite, in a Fedora toolbox:
+  `distrobox create -n pokopia-build -i registry.fedoraproject.org/fedora-toolbox:45`, then
+  `sudo dnf install rust cargo nodejs npm gcc webkit2gtk4.1-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel`.
+
+Tested on Bazzite 45 (RTX 4070 Ti, Wayland): `cargo test` (also `cargo check --target x86_64-pc-windows-gnu --all-targets`), the
+window, the checks, the tool download, Proton detection, Link Play addresses, Eden save detection, `test_pkp_build.py`, and the
+Linux Zig compiling `pkp_stub.cpp` and linking a PE with `pkp.rc` and `pkp_rt.lib`. Not yet run end to end, for want of a 2.0.1
+(update 655360) dump with its base game: the game build, the shader translation under Proton, the hidden first run and Play.
+
 ## Development
 
 - `cargo check` in `src-tauri`; `npm run tauri build` for the exe.

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The launcher's whole first-run setup without the window (release check of model b):
 //!   cargo run --release --example first_run -- <game dir> <exefs> <romfs> <tools dir> [shader limit] [jobs]
-//! Builds pkp.exe from the dump (gamebuild.rs) and then the shader cache (shaders.rs), the same code Set up runs.
-//! Prints each phase's time.
+//! Builds pkp.exe from the dump (gamebuild.rs) and then the shader cache (shaders.rs), the same code Set up runs; on Linux
+//! it fetches the Linux build tools first (host.rs). Prints each phase's time.
 
 #[path = "../src/gamebuild.rs"]
 mod gamebuild;
+#[allow(dead_code)]
+#[path = "../src/host.rs"]
+mod host;
 #[path = "../src/shaders.rs"]
 mod shaders;
 
@@ -44,6 +47,11 @@ fn main() {
             last = msg.to_string();
         }
     };
+    match host::prepare_tools(&tools_dir, &cancel, &mut |_, _, msg| tick("tools", &msg)) {
+        Ok(true) => {}
+        Ok(false) => fail("paused".into()),
+        Err(e) => fail(e),
+    }
     if !gamebuild::is_built(&game, &tools_dir) {
         let tools = gamebuild::find_tools(&tools_dir).unwrap_or_else(|e| fail(e));
         let job = gamebuild::Job { game_dir: game.clone(), exefs: PathBuf::from(&a[1]), jobs, idle: false, log: None };

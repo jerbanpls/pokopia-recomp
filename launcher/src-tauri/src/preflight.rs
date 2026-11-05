@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Checks before Set up starts: free disk space, Vulkan, RAM, and a warning for the Intel Core CPUs that crash under long
-//! heavy loads. Every check except the disk space is a warning the player can continue past. `evaluate` is a pure function
-//! of `Facts` (tests below); `probe` fills `Facts` from Windows.
+//! heavy loads; on Linux also Proton, which runs the shader translator and the game. Every check except the disk space and
+//! Proton is a warning the player can continue past. `evaluate` is a pure function of `Facts` (tests below); `probe` fills
+//! `Facts` from Windows or Linux.
 //!
 //! The Intel check and the "gentle" job count follow pokopia-native (MIT), nxs2.py `intel_microcode_warning` and
 //! `gentle_jobs` @7c3655d: 13th/14th generation desktop CPUs need Intel's 0x12B microcode (a BIOS update) or sustained
@@ -66,7 +67,7 @@ pub struct Gpu {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Vulkan {
-    /// vulkan-1.dll did not load
+    /// vulkan-1.dll (libvulkan.so.1) did not load
     NoLoader(String),
     /// the loader is there but made no instance or found no device
     Failed(String),
@@ -82,6 +83,8 @@ pub struct Facts {
     pub ram_total: Option<u64>,
     pub cpu_brand: Option<String>,
     pub microcode: Option<u32>,
+    /// Linux: what runs the Windows programs (host.rs runner: Ok(its name), Err(what to install)). None on Windows.
+    pub runner: Option<Result<String, String>>,
 }
 
 /// What of setup is still to do, as far as the disk goes.
@@ -182,7 +185,7 @@ pub fn evaluate(f: &Facts) -> Report {
             "vulkan",
             Level::Warn,
             "Vulkan not found",
-            format!("vulkan-1.dll did not load ({}). It comes with the graphics driver: install the current driver from NVIDIA, AMD or Intel. Setup can finish without it, but the game cannot start.", e),
+            format!("{} did not load ({}). It comes with the graphics driver: install the current driver from NVIDIA, AMD or Intel. Setup can finish without it, but the game cannot start.", sys::VULKAN_LOADER, e),
         ),
         Vulkan::Failed(e) => push(
             "vulkan",
@@ -202,6 +205,12 @@ pub fn evaluate(f: &Facts) -> Report {
                 push("vulkan", Level::Ok, "Vulkan", names.join("; "));
             }
         }
+    }
+
+    match &f.runner {
+        Some(Ok(name)) => push("proton", Level::Ok, "Proton", format!("The shader translator and the game run with {}.", name)),
+        Some(Err(e)) => push("proton", Level::Fail, "No Proton found", e.clone()),
+        None => {}
     }
 
     match f.ram_total {
@@ -259,6 +268,7 @@ pub fn parse_gpu(props: &[u8]) -> Option<Gpu> {
 
 /// "Update Revision" of the registry's CentralProcessor key: eight bytes, the revision in the second dword (the first on
 /// some systems that give four).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn microcode_of(raw: &[u8]) -> Option<u32> {
     let at = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
     match raw.len() {
@@ -280,6 +290,10 @@ pub fn probe(game_dir: &Path, r: &Remaining) -> Facts {
         ram_total: sys::ram_total(),
         cpu_brand: brand,
         microcode,
+        #[cfg(windows)]
+        runner: None,
+        #[cfg(not(windows))]
+        runner: Some(crate::host::runner().map(|r| r.label)),
     }
 }
 
@@ -295,7 +309,7 @@ pub fn drive_of(p: &Path) -> String {
 
 #[cfg(windows)]
 mod sys {
-    use super::{parse_gpu, Vulkan};
+    use super::Vulkan;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
@@ -377,84 +391,93 @@ mod sys {
         (brand, micro)
     }
 
-    /// Loads vulkan-1.dll from System32, makes an instance and lists its devices. The loader runs the driver in this process.
-    pub fn vulkan() -> Vulkan {
-        #[repr(C)]
-        struct InstanceInfo {
-            s_type: u32,
-            next: *const c_void,
-            flags: u32,
-            app: *const c_void,
-            layers: u32,
-            layer_names: *const *const u8,
-            exts: u32,
-            ext_names: *const *const u8,
-        }
-        type GetProc = unsafe extern "system" fn(*mut c_void, *const u8) -> *mut c_void;
-        type Create = unsafe extern "system" fn(*const InstanceInfo, *const c_void, *mut *mut c_void) -> i32;
-        type Enum = unsafe extern "system" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32;
-        type Props = unsafe extern "system" fn(*mut c_void, *mut u64);
-        type Destroy = unsafe extern "system" fn(*mut c_void, *const c_void);
+    pub const VULKAN_LOADER: &str = "vulkan-1.dll";
 
+    /// Loads vulkan-1.dll from System32 and lists its devices (super::list_gpus).
+    pub fn vulkan() -> Vulkan {
         const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
         unsafe {
             let dll = LoadLibraryExW(wide("vulkan-1.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
             if dll.is_null() {
                 return Vulkan::NoLoader(std::io::Error::last_os_error().to_string());
             }
-            let out = (|| {
-                let gpa = GetProcAddress(dll, b"vkGetInstanceProcAddr\0".as_ptr());
-                if gpa.is_null() {
-                    return Vulkan::Failed("vulkan-1.dll has no vkGetInstanceProcAddr".into());
-                }
-                let gpa: GetProc = std::mem::transmute(gpa);
-                let create = gpa(std::ptr::null_mut(), b"vkCreateInstance\0".as_ptr());
-                if create.is_null() {
-                    return Vulkan::Failed("the Vulkan loader has no vkCreateInstance".into());
-                }
-                let create: Create = std::mem::transmute(create);
-                let info = InstanceInfo { s_type: 1, next: std::ptr::null(), flags: 0, app: std::ptr::null(), layers: 0, layer_names: std::ptr::null(), exts: 0, ext_names: std::ptr::null() };
-                let mut inst: *mut c_void = std::ptr::null_mut();
-                let rc = create(&info, std::ptr::null(), &mut inst);
-                if rc != 0 || inst.is_null() {
-                    return Vulkan::Failed(format!("vkCreateInstance failed (VkResult {}): no working Vulkan driver", rc));
-                }
-                let enumerate = gpa(inst, b"vkEnumeratePhysicalDevices\0".as_ptr());
-                let props = gpa(inst, b"vkGetPhysicalDeviceProperties\0".as_ptr());
-                let destroy = gpa(inst, b"vkDestroyInstance\0".as_ptr());
-                let mut gpus = Vec::new();
-                if !enumerate.is_null() && !props.is_null() {
-                    let enumerate: Enum = std::mem::transmute(enumerate);
-                    let props: Props = std::mem::transmute(props);
-                    let mut n = 0u32;
-                    if enumerate(inst, &mut n, std::ptr::null_mut()) == 0 && n > 0 {
-                        let mut devs = vec![std::ptr::null_mut::<c_void>(); n as usize];
-                        if enumerate(inst, &mut n, devs.as_mut_ptr()) >= 0 {
-                            for d in devs.iter().take(n as usize) {
-                                // VkPhysicalDeviceProperties is 824 bytes
-                                let mut buf = [0u64; 128];
-                                props(*d, buf.as_mut_ptr());
-                                let bytes: Vec<u8> = buf.iter().flat_map(|x| x.to_le_bytes()).collect();
-                                if let Some(g) = parse_gpu(&bytes) {
-                                    gpus.push(g);
-                                }
-                            }
-                        }
-                    }
-                }
-                if !destroy.is_null() {
-                    let destroy: Destroy = std::mem::transmute(destroy);
-                    destroy(inst, std::ptr::null());
-                }
-                if gpus.is_empty() {
-                    Vulkan::Failed("The Vulkan loader found no graphics device".into())
-                } else {
-                    Vulkan::Gpus(gpus)
-                }
-            })();
+            let gpa = GetProcAddress(dll, b"vkGetInstanceProcAddr\0".as_ptr());
+            let out = if gpa.is_null() {
+                Vulkan::Failed("vulkan-1.dll has no vkGetInstanceProcAddr".into())
+            } else {
+                super::list_gpus(std::mem::transmute::<*mut c_void, super::GetProc>(gpa))
+            };
             FreeLibrary(dll);
             out
         }
+    }
+}
+
+/// vkGetInstanceProcAddr
+type GetProc = unsafe extern "system" fn(*mut std::ffi::c_void, *const u8) -> *mut std::ffi::c_void;
+
+/// Makes an instance through the loader's vkGetInstanceProcAddr and lists its devices. The loader runs the driver in this
+/// process. The Windows and the Linux probe share it.
+unsafe fn list_gpus(gpa: GetProc) -> Vulkan {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct InstanceInfo {
+        s_type: u32,
+        next: *const c_void,
+        flags: u32,
+        app: *const c_void,
+        layers: u32,
+        layer_names: *const *const u8,
+        exts: u32,
+        ext_names: *const *const u8,
+    }
+    type Create = unsafe extern "system" fn(*const InstanceInfo, *const c_void, *mut *mut c_void) -> i32;
+    type Enum = unsafe extern "system" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32;
+    type Props = unsafe extern "system" fn(*mut c_void, *mut u64);
+    type Destroy = unsafe extern "system" fn(*mut c_void, *const c_void);
+
+    let create = gpa(std::ptr::null_mut(), b"vkCreateInstance\0".as_ptr());
+    if create.is_null() {
+        return Vulkan::Failed("the Vulkan loader has no vkCreateInstance".into());
+    }
+    let create: Create = std::mem::transmute(create);
+    let info = InstanceInfo { s_type: 1, next: std::ptr::null(), flags: 0, app: std::ptr::null(), layers: 0, layer_names: std::ptr::null(), exts: 0, ext_names: std::ptr::null() };
+    let mut inst: *mut c_void = std::ptr::null_mut();
+    let rc = create(&info, std::ptr::null(), &mut inst);
+    if rc != 0 || inst.is_null() {
+        return Vulkan::Failed(format!("vkCreateInstance failed (VkResult {}): no working Vulkan driver", rc));
+    }
+    let enumerate = gpa(inst, b"vkEnumeratePhysicalDevices\0".as_ptr());
+    let props = gpa(inst, b"vkGetPhysicalDeviceProperties\0".as_ptr());
+    let destroy = gpa(inst, b"vkDestroyInstance\0".as_ptr());
+    let mut gpus = Vec::new();
+    if !enumerate.is_null() && !props.is_null() {
+        let enumerate: Enum = std::mem::transmute(enumerate);
+        let props: Props = std::mem::transmute(props);
+        let mut n = 0u32;
+        if enumerate(inst, &mut n, std::ptr::null_mut()) == 0 && n > 0 {
+            let mut devs = vec![std::ptr::null_mut::<c_void>(); n as usize];
+            if enumerate(inst, &mut n, devs.as_mut_ptr()) >= 0 {
+                for d in devs.iter().take(n as usize) {
+                    // VkPhysicalDeviceProperties is 824 bytes
+                    let mut buf = [0u64; 128];
+                    props(*d, buf.as_mut_ptr());
+                    let bytes: Vec<u8> = buf.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    if let Some(g) = parse_gpu(&bytes) {
+                        gpus.push(g);
+                    }
+                }
+            }
+        }
+    }
+    if !destroy.is_null() {
+        let destroy: Destroy = std::mem::transmute(destroy);
+        destroy(inst, std::ptr::null());
+    }
+    if gpus.is_empty() {
+        Vulkan::Failed("The Vulkan loader found no graphics device".into())
+    } else {
+        Vulkan::Gpus(gpus)
     }
 }
 
@@ -462,17 +485,53 @@ mod sys {
 mod sys {
     use super::Vulkan;
     use std::path::Path;
-    pub fn free_bytes(_: &Path) -> Option<u64> {
-        None
+
+    pub const VULKAN_LOADER: &str = "libvulkan.so.1";
+
+    pub fn free_bytes(dir: &Path) -> Option<u64> {
+        crate::host::free_bytes(dir)
     }
+
     pub fn ram_total() -> Option<u64> {
-        None
+        meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal").map(|kb| kb * 1024)
     }
+
     pub fn cpu() -> (Option<String>, Option<u32>) {
-        (None, None)
+        cpuinfo(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default())
     }
+
+    /// A `/proc/meminfo` value: `MemTotal:  16351904 kB` -> 16351904.
+    pub fn meminfo_kb(text: &str, key: &str) -> Option<u64> {
+        text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':')?.split_whitespace().next()?.parse().ok())
+    }
+
+    /// (brand string, microcode revision) of the first CPU in `/proc/cpuinfo` ("model name", "microcode : 0x12b").
+    pub fn cpuinfo(text: &str) -> (Option<String>, Option<u32>) {
+        let field = |key: &str| {
+            text.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                (k.trim() == key).then(|| v.trim().to_string())
+            })
+        };
+        let micro = field("microcode").and_then(|m| u32::from_str_radix(m.trim_start_matches("0x"), 16).ok());
+        (field("model name"), micro)
+    }
+
+    /// Loads libvulkan.so.1 and lists its devices (super::list_gpus). The loader stays loaded: unloading it can unload a
+    /// driver (NVIDIA's) that still has threads running.
     pub fn vulkan() -> Vulkan {
-        Vulkan::NoLoader("not Windows".into())
+        unsafe {
+            let lib = libc::dlopen(c"libvulkan.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if lib.is_null() {
+                let err = libc::dlerror();
+                return Vulkan::NoLoader(if err.is_null() { "not found".into() } else { std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned() });
+            }
+            let gpa = libc::dlsym(lib, c"vkGetInstanceProcAddr".as_ptr());
+            if gpa.is_null() {
+                return Vulkan::Failed("libvulkan.so.1 has no vkGetInstanceProcAddr".into());
+            }
+            super::list_gpus(std::mem::transmute::<*mut libc::c_void, super::GetProc>(gpa))
+        }
     }
 }
 
@@ -489,7 +548,35 @@ mod tests {
             ram_total: Some(32 * GB),
             cpu_brand: Some("AMD Ryzen 7 5800X 8-Core Processor".into()),
             microcode: None,
+            runner: None,
         }
+    }
+
+    #[test]
+    fn proton_is_checked_on_linux_only() {
+        let mut f = facts();
+        assert!(!evaluate(&f).checks.iter().any(|c| c.id == "proton"));
+        f.runner = Some(Ok("Proton - Experimental in SteamLinuxRuntime_sniper".into()));
+        assert_eq!(level(&evaluate(&f), "proton"), Level::Ok);
+        f.runner = Some(Err("install Proton".into()));
+        let r = evaluate(&f);
+        assert_eq!(level(&r, "proton"), Level::Fail);
+        assert!(r.blocked);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_proc_files_parse() {
+        let mem = "MemTotal:       16351904 kB\nMemFree:          612340 kB\nMemAvailable:    7107416 kB\n";
+        assert_eq!(super::sys::meminfo_kb(mem, "MemTotal"), Some(16351904));
+        assert_eq!(super::sys::meminfo_kb(mem, "MemAvailable"), Some(7107416));
+        assert_eq!(super::sys::meminfo_kb(mem, "SwapTotal"), None);
+        let cpu = "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: 13th Gen Intel(R) Core(TM) i9-13900K\nmicrocode\t: 0x129\n\nprocessor\t: 1\nmodel name\t: other\n";
+        let (brand, micro) = super::sys::cpuinfo(cpu);
+        assert_eq!(brand.as_deref(), Some("13th Gen Intel(R) Core(TM) i9-13900K"));
+        assert_eq!(micro, Some(0x129));
+        assert!(raptor_lake_desktop(&brand.unwrap()));
+        assert_eq!(super::sys::cpuinfo("model name\t: AMD Ryzen 9 9900X 12-Core Processor\n"), (Some("AMD Ryzen 9 9900X 12-Core Processor".into()), None));
     }
 
     fn level(r: &Report, id: &str) -> Level {

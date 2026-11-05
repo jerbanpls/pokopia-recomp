@@ -3,7 +3,6 @@
 
 use serde::Serialize;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
@@ -82,7 +81,14 @@ pub fn start(app: &AppHandle, game_dir: &Path, minimize: bool) -> Result<(), Str
             Err(e) => format!(" Shaders were not prepared: {}.", e),
             _ => String::new(),
         };
-        let mut cmd = Command::new(&exe);
+        // Linux: through Proton (host.rs)
+        let mut cmd = match crate::host::windows_program(&exe) {
+            Ok(c) => c,
+            Err(e) => {
+                set_status(&app2, Status { state: "exited".into(), crashed: true, message: format!("Could not start pkp.exe: {}", e), ..Default::default() });
+                return;
+            }
+        };
         // every path (exefs, romfs, shader cache) comes from pkp.ini next to pkp.exe
         cmd.current_dir(&dir).args(["--log", "pkp.log"]);
         #[cfg(windows)]
@@ -137,11 +143,11 @@ pub fn start(app: &AppHandle, game_dir: &Path, minimize: bool) -> Result<(), Str
 }
 
 pub fn open_with_shell(path: &Path) -> Result<(), String> {
-    // explorer opens a file in its default app and a folder in a window
-    Command::new("explorer.exe").arg(path).spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {}", path.display(), e))
+    // explorer (Linux: xdg-open) opens a file in its default app and a folder in a window
+    crate::host::open(path.as_os_str())
 }
 
-/// Opens an http(s) link in the default browser (same explorer.exe route as open_with_shell).
+/// Opens an http(s) link in the default browser (same route as open_with_shell).
 pub fn open_url(url: &str) -> Result<(), String> {
-    Command::new("explorer.exe").arg(url).spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {}", url, e))
+    crate::host::open(std::ffi::OsStr::new(url))
 }

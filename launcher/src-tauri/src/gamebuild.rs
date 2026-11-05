@@ -8,7 +8,8 @@
 //! only if `pkp_build.py --check` says done.json matches the tools this release ships (lifter, main.sites, pkp_rt.lib, ...).
 //! An update extracted over an install leaves the old pkp.exe and done.json behind: the check calls that stale, so Play
 //! asks for Set up again and Set up rebuilds (the old pkp.exe stays until the new one is linked over it).
-//! No crate-local imports, so `examples/first_run.rs` can build this file alone.
+//! On Linux the script runs with the Linux Python and Zig that host.rs fetches into `tools/linux`.
+//! Its only crate-local import is host.rs, which has none, so `examples/first_run.rs` can build the two files alone.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -103,18 +104,15 @@ pub fn is_built(game_dir: &Path, tools_dir: &Path) -> bool {
 }
 
 pub fn find_tools(tools_dir: &Path) -> Result<Tools, String> {
-    let python = tools_dir.join("python").join("python.exe");
+    let python = crate::host::python(tools_dir);
     let script = tools_dir.join("build").join("pkp_build.py");
     let mut missing = Vec::new();
-    if !python.is_file() {
-        missing.push(python.display().to_string());
-    }
-    if !script.is_file() {
-        missing.push(script.display().to_string());
-    }
-    for p in ["build/zig/zig.exe", "build/sdk/pkp_rt.lib", "build/recomp/nxrecomp/__main__.py"] {
-        if !tools_dir.join(p).is_file() {
-            missing.push(tools_dir.join(p).display().to_string());
+    for p in [python.clone(), script.clone(), crate::host::zig(tools_dir)]
+        .into_iter()
+        .chain(["build/sdk/pkp_rt.lib", "build/recomp/nxrecomp/__main__.py"].iter().map(|p| tools_dir.join(p)))
+    {
+        if !p.is_file() {
+            missing.push(p.display().to_string());
         }
     }
     if !missing.is_empty() {
@@ -131,7 +129,7 @@ fn quiet(cmd: &mut Command, idle: bool) {
         cmd.creation_flags(0x0800_0000 | if idle { 0x0000_0040 } else { 0x0000_4000 });
     }
     #[cfg(not(windows))]
-    let _ = (cmd, idle);
+    crate::host::lower_priority(cmd, idle);
 }
 
 /// Runs the build. Ok(true) = pkp.exe built, Ok(false) = paused, Err = what went wrong, in the script's words.

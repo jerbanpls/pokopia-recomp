@@ -11,7 +11,10 @@ use serde::Serialize;
 use std::net::Ipv4Addr;
 
 pub const PUBLIC_WARNING: &str = "Windows treats this network as Public, so other PCs may not reach you. Set it to Private in Settings > Network.";
+#[cfg(windows)]
 pub const FIREWALL_HINT: &str = "If Windows Firewall asks about this program, allow it on Private networks. If it was answered wrongly once, remove the Block rules for the program in Windows Defender Firewall > Allow an app.";
+#[cfg(not(windows))]
+pub const FIREWALL_HINT: &str = "If visitors cannot connect, the firewall may block the port (39660 unless you changed it). With firewalld (Fedora, Bazzite): sudo firewall-cmd --add-port=39660/tcp --add-port=39660/udp";
 
 /// IfType values we care about (IANA).
 pub const IF_WIFI: u32 = 71;
@@ -176,7 +179,7 @@ pub fn rank(adapters: &[Adapter]) -> LanReport {
     rep
 }
 
-/// Reads this PC's adapters and ranks them. Off Windows there is nothing to read.
+/// Reads this PC's adapters (Windows: IP Helper; Linux: getifaddrs) and ranks them.
 pub fn report() -> LanReport {
     rank(&sys::adapters())
 }
@@ -314,9 +317,88 @@ mod sys {
 #[cfg(not(windows))]
 mod sys {
     use super::*;
-    /// No Windows API here (native Linux has no network profiles): nothing to list.
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    /// /proc/net/route: interface -> lowest metric of its default routes (destination and mask 0).
+    pub fn default_routes(text: &str) -> HashMap<String, u32> {
+        let mut out: HashMap<String, u32> = HashMap::new();
+        for l in text.lines().skip(1) {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() >= 8 && f[1] == "00000000" && f[7] == "00000000" {
+                let metric = f[6].parse().unwrap_or(0);
+                let m = out.entry(f[0].to_string()).or_insert(metric);
+                *m = (*m).min(metric);
+            }
+        }
+        out
+    }
+
+    /// (IfType, description) for `classify`, which reads the description the way it reads a Windows adapter's: what kind of
+    /// link the interface is, from its name and sysfs.
+    fn kind(name: &str, loopback: bool) -> (u32, &'static str) {
+        let sys = Path::new("/sys/class/net").join(name);
+        let ty: u32 = std::fs::read_to_string(sys.join("type")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(1);
+        let driver = std::fs::read_link(sys.join("device").join("driver")).ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default();
+        if loopback || ty == 772 {
+            (IF_LOOPBACK, "loopback")
+        } else if name.starts_with("tailscale") {
+            (IF_TUNNEL, "Tailscale")
+        } else if name.starts_with("zt") {
+            (6, "ZeroTier")
+        } else if driver == "rndis_host" || driver == "ipheth" {
+            (6, "USB-tethered phone (rndis)")
+        } else if ty == 512 {
+            (IF_PPP, "PPP link")
+        } else if sys.join("tun_flags").exists() || matches!(ty, 65534 | 768 | 769 | 776 | 778 | 823) {
+            // tun/tap, WireGuard (no link-layer header), IP-in-IP, sit, GRE
+            (IF_TUNNEL, "VPN or tunnel")
+        } else if sys.join("wireless").exists() || sys.join("phy80211").exists() {
+            (IF_WIFI, "Wi-Fi")
+        } else if std::fs::canonicalize(&sys).map(|p| p.to_string_lossy().contains("/virtual/")).unwrap_or(false) {
+            // bridges and veth pairs of Docker, Podman, libvirt (virbr0), LXC
+            (6, "virtual bridge (pseudo-interface)")
+        } else {
+            (6, "Ethernet")
+        }
+    }
+
+    /// The IPv4 addresses of this PC's interfaces (getifaddrs). Linux has no Public/Private network profiles: `public` is None.
     pub fn adapters() -> Vec<Adapter> {
-        Vec::new()
+        let routes = default_routes(&std::fs::read_to_string("/proc/net/route").unwrap_or_default());
+        let mut out = Vec::new();
+        // SAFETY: getifaddrs hands out a list that stays valid until freeifaddrs; only AF_INET entries are read as sockaddr_in
+        unsafe {
+            let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut list) != 0 {
+                return out;
+            }
+            let mut p = list;
+            while !p.is_null() {
+                let a = &*p;
+                p = a.ifa_next;
+                if a.ifa_addr.is_null() || (*a.ifa_addr).sa_family as i32 != libc::AF_INET {
+                    continue;
+                }
+                let ip = Ipv4Addr::from(u32::from_be((*(a.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr));
+                let name = std::ffi::CStr::from_ptr(a.ifa_name).to_string_lossy().into_owned();
+                let flags = a.ifa_flags as i32;
+                let (if_type, description) = kind(&name, flags & libc::IFF_LOOPBACK != 0);
+                let route = routes.get(&name).copied();
+                out.push(Adapter {
+                    up: flags & libc::IFF_UP != 0 && flags & libc::IFF_RUNNING != 0,
+                    friendly_name: name,
+                    description: description.into(),
+                    if_type,
+                    ip,
+                    has_gateway: route.is_some(),
+                    metric: route.unwrap_or(0),
+                    public: None,
+                });
+            }
+            libc::freeifaddrs(list);
+        }
+        out
     }
 }
 
@@ -331,6 +413,46 @@ mod tests {
         a.has_gateway = true;
         a.metric = metric;
         a
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_routes_and_interfaces() {
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     enp3s0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+                     wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                     wlan0\t00000000\t0101A8C0\t0003\t0\t0\t20\t00000000\t0\t0\t0\n\
+                     enp3s0\t0000000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+        let r = super::sys::default_routes(route);
+        assert_eq!((r.get("enp3s0"), r.get("wlan0"), r.len()), (Some(&100), Some(&20), 2));
+        // what sys::adapters makes of a Bazzite PC: the LAN first, Tailscale as an overlay, the rest not offered
+        let lin = |name: &str, desc: &str, ty: u32, ip: &str| Adapter {
+            friendly_name: name.into(),
+            description: desc.into(),
+            if_type: ty,
+            up: true,
+            ip: ip.parse().unwrap(),
+            has_gateway: false,
+            metric: 0,
+            public: None,
+        };
+        let v = vec![
+            lin("lo", "loopback", IF_LOOPBACK, "127.0.0.1"),
+            gw(lin("enp3s0", "Ethernet", 6, "10.0.0.5"), 100),
+            lin("tailscale0", "Tailscale", IF_TUNNEL, "100.101.102.103"),
+            lin("virbr0", "virtual bridge (pseudo-interface)", 6, "192.168.122.1"),
+            lin("wg0", "VPN or tunnel", IF_TUNNEL, "10.8.0.2"),
+            lin("usb0", "USB-tethered phone (rndis)", 6, "192.168.42.129"),
+        ];
+        let rep = rank(&v);
+        assert_eq!(rep.lan.iter().map(|a| a.ip.as_str()).collect::<Vec<_>>(), vec!["10.0.0.5"]);
+        assert!(rep.lan[0].default_route && !rep.lan[0].public_profile);
+        assert_eq!(rep.overlay.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), vec!["internet via Tailscale"]);
+        let why = |name: &str| rep.skipped.iter().find(|s| s.adapter == name).map(|s| s.reason.clone());
+        assert_eq!(why("virbr0").as_deref(), Some("virtual adapter"));
+        assert_eq!(why("wg0").as_deref(), Some("VPN or tunnel adapter"));
+        assert_eq!(why("usb0").as_deref(), Some("USB-tethered phone"));
+        assert!(rep.warning.is_none() && rep.firewall_hint.is_none());
     }
 
     #[test]

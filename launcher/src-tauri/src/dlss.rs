@@ -30,7 +30,8 @@ pub fn target_dir(game_dir: &Path) -> PathBuf {
 }
 
 fn tools(tools_dir: &Path) -> (PathBuf, PathBuf) {
-    (tools_dir.join("python").join("python.exe"), tools_dir.join("build").join("fetch_dlss.py"))
+    // Linux: the Python that Set up fetches into tools/linux, so the download is there once setup has started
+    (crate::host::python(tools_dir), tools_dir.join("build").join("fetch_dlss.py"))
 }
 
 pub fn status(game_dir: &Path, tools_dir: &Path) -> Status {
@@ -42,8 +43,16 @@ pub fn status(game_dir: &Path, tools_dir: &Path) -> Status {
 /// Runs the download. Progress lines are `@progress download <done> <total> <text>`, a failure is `@error <text>`.
 pub fn fetch(game_dir: &Path, tools_dir: &Path, mut report: impl FnMut(Progress)) -> Result<(), String> {
     let (py, script) = tools(tools_dir);
-    if !py.is_file() || !script.is_file() {
+    if !script.is_file() {
         return Err("This package has no DLSS download tool. Extract the release zip again so tools/ is complete.".into());
+    }
+    if !py.is_file() {
+        return Err(if cfg!(windows) {
+            "This package has no DLSS download tool. Extract the release zip again so tools/ is complete."
+        } else {
+            "The download needs the Linux build tools that Set up fetches: run Set up first (Game files)."
+        }
+        .into());
     }
     let mut cmd = Command::new(&py);
     cmd.arg("-I").arg(&script).arg("--dir").arg(target_dir(game_dir));

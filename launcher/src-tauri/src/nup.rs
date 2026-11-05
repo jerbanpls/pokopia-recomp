@@ -354,8 +354,8 @@ pub fn free_space(path: &Path) -> Option<u64> {
     (ok != 0).then_some(avail)
 }
 #[cfg(not(windows))]
-pub fn free_space(_path: &Path) -> Option<u64> {
-    None
+pub fn free_space(path: &Path) -> Option<u64> {
+    crate::host::free_bytes(path)
 }
 
 /// Unpacks `nup_path` into `out`. A finished unpack of the same package is reused. `progress(done, total, current file)`

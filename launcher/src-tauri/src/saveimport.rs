@@ -139,9 +139,18 @@ pub fn find_sources(appdata: &Path, eden_dir: Option<&Path>, ryujinx_dir: Option
 }
 
 pub fn find_sources_here() -> Vec<Source> {
-    let appdata = PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default());
     let env_dir = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    find_sources(&appdata, env_dir("EDEN_DIR").as_deref(), env_dir("RYUJINX_DIR").as_deref())
+    #[cfg(windows)]
+    let (appdata, eden, ryujinx) = (PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()), env_dir("EDEN_DIR"), env_dir("RYUJINX_DIR"));
+    // Linux: Eden keeps its data in $XDG_DATA_HOME/eden, Ryujinx in $XDG_CONFIG_HOME/Ryujinx
+    #[cfg(not(windows))]
+    let (appdata, eden, ryujinx) = {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let data = env_dir("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share"));
+        let config = env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+        (PathBuf::new(), env_dir("EDEN_DIR").or(Some(data.join("eden"))), env_dir("RYUJINX_DIR").or(Some(config.join("Ryujinx"))))
+    };
+    find_sources(&appdata, eden.as_deref(), ryujinx.as_deref())
 }
 
 // ---- where the runtime keeps the save ------------------------------------------------------------------------------------------------
@@ -359,9 +368,12 @@ pub fn game_running() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("pkp.exe"))
         .unwrap_or(false)
 }
+/// Linux: a process named pkp.exe (Wine names a Windows program's process after its exe), also one Steam started.
 #[cfg(not(windows))]
 pub fn game_running() -> bool {
-    false
+    fs::read_dir("/proc")
+        .map(|rd| rd.flatten().any(|e| fs::read_to_string(e.path().join("comm")).map(|c| c.trim() == "pkp.exe").unwrap_or(false)))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -537,6 +549,7 @@ mod tests {
         let g = Path::new("C:/game");
         assert_eq!(save_dir_of(g, ""), g.join("save"));
         assert_eq!(save_dir_of(g, "saves"), g.join("saves"));
-        assert_eq!(save_dir_of(g, "D:/s"), PathBuf::from("D:/s"));
+        let abs = if cfg!(windows) { "D:/s" } else { "/mnt/s" };
+        assert_eq!(save_dir_of(g, abs), PathBuf::from(abs));
     }
 }

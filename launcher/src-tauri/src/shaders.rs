@@ -11,7 +11,8 @@
 //! `corpus/unique.tsv`, rewritten per chunk) into `shader_cache/stage`, and a chunk counts only once its `.spv` files are
 //! moved into `spirv/` and its rows appended to `spirv/results.tsv`. A block with a row there is never translated again.
 //! `shader_cache/setup.json` records what is done. The tools run at below-normal priority.
-//! No crate-local imports, so `examples/shader_setup.rs` can build this file alone.
+//! On Linux the extractor runs with the Linux Python and the translator (a Windows program) through Proton (host.rs).
+//! Its only crate-local import is host.rs, which has none, so `examples/shader_setup.rs` can build the two files alone.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -31,7 +32,8 @@ pub const MISSING_REL: &str = "shader_cache/missing";
 /// Every run-time block seen so far, kept with its code (manifest.tsv, code_<hash>.bin, ctrl_<hash>.bin), so each Play
 /// can check that all of them are translated without running the game.
 pub const RUNTIME_REL: &str = "shader_cache/runtime";
-const CHUNK: usize = 1000;
+/// Blocks per translator run. Under Proton every run also starts Proton (a few seconds), so Linux runs fewer, larger chunks.
+const CHUNK: usize = if cfg!(windows) { 1000 } else { 5000 };
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
@@ -104,7 +106,7 @@ fn quiet(cmd: &mut Command, idle: bool) {
         cmd.creation_flags(0x0800_0000 | if idle { 0x0000_0040 } else { 0x0000_4000 });
     }
     #[cfg(not(windows))]
-    let _ = (cmd, idle);
+    crate::host::lower_priority(cmd, idle);
 }
 
 fn python_has_lz4(py: &Path) -> bool {
@@ -118,8 +120,9 @@ fn on_path(exe: &str) -> Vec<PathBuf> {
     std::env::var_os("PATH").map(|p| std::env::split_paths(&p).map(|d| d.join(exe)).filter(|f| f.is_file()).collect()).unwrap_or_default()
 }
 
-/// Finds the tools in `tools_dir` (the launcher's `tools/` folder). Python: `tools/python/python.exe`, else the first
-/// python.exe on PATH that has `lz4`. Every missing piece is named in the error.
+/// Finds the tools in `tools_dir` (the launcher's `tools/` folder). Python: `tools/python/python.exe` (Linux:
+/// `tools/linux/python/bin/python3`), else the first python.exe (python3) on PATH that has `lz4`. Every missing piece is named
+/// in the error.
 pub fn find_tools(tools_dir: &Path) -> Result<Tools, String> {
     let mut missing = Vec::new();
     let harness = tools_dir.join("spirv_harness").join("spirv_harness.exe");
@@ -130,9 +133,9 @@ pub fn find_tools(tools_dir: &Path) -> Result<Tools, String> {
     if !extract.is_file() {
         missing.push(format!("the shader extractor ({})", extract.display()));
     }
-    let bundled = tools_dir.join("python").join("python.exe");
+    let bundled = crate::host::python(tools_dir);
     let mut candidates = vec![bundled.clone()];
-    candidates.extend(on_path("python.exe"));
+    candidates.extend(on_path(if cfg!(windows) { "python.exe" } else { "python3" }));
     let python = candidates.into_iter().filter(|p| p.is_file()).find(|p| python_has_lz4(p));
     if python.is_none() {
         missing.push(format!(
@@ -153,7 +156,8 @@ fn is_progress_line(l: &str) -> bool {
 
 /// Runs a tool, handing each stdout line to `line`; kills it when `cancel` is set. Ok(true) = exit 0, Ok(false) = cancelled.
 /// `log` gets the command line, the tool's stderr and non-progress stdout, and on failure the end of its output.
-fn run_tool(mut cmd: Command, cancel: &AtomicBool, idle: bool, log: Option<&LogFn>, mut line: impl FnMut(&str)) -> Result<bool, String> {
+/// `limit`: killed after that long, an error.
+fn run_tool(mut cmd: Command, cancel: &AtomicBool, idle: bool, log: Option<&LogFn>, limit: Option<Duration>, mut line: impl FnMut(&str)) -> Result<bool, String> {
     quiet(&mut cmd, idle);
     let name = cmd.get_program().to_string_lossy().to_string();
     let say = |t: &str| {
@@ -184,6 +188,7 @@ fn run_tool(mut cmd: Command, cancel: &AtomicBool, idle: bool, log: Option<&LogF
         let _ = etx.send(tail.join("\n"));
     });
     drop(tx);
+    let deadline = limit.map(|d| std::time::Instant::now() + d);
     let mut out_tail: Vec<String> = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -199,26 +204,35 @@ fn run_tool(mut cmd: Command, cancel: &AtomicBool, idle: bool, log: Option<&LogF
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // stdout closed: the process is ending
-                let st = child.wait().map_err(|e| e.to_string())?;
-                if cancel.load(Ordering::SeqCst) {
-                    say(&format!("stopped: {} (paused by the player)", name));
-                    return Ok(false);
+                // stdout closed: the process is ending. Polled, so Pause and the time limit still apply while it does (Proton's
+                // wrapper waits for every wine process of the prefix)
+                if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                    if cancel.load(Ordering::SeqCst) {
+                        say(&format!("stopped: {} (paused by the player)", name));
+                        return Ok(false);
+                    }
+                    if st.success() {
+                        say(&format!("done: {}", name));
+                        return Ok(true);
+                    }
+                    let tail = erx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+                    say(&format!("FAILED: {} ({}). Last output:\n{}\nLast error output:\n{}", name, st, out_tail.join("\n"), tail));
+                    return Err(format!("{} failed ({}). {}", name, st, tail.trim()));
                 }
-                if st.success() {
-                    say(&format!("done: {}", name));
-                    return Ok(true);
-                }
-                let tail = erx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-                say(&format!("FAILED: {} ({}). Last output:\n{}\nLast error output:\n{}", name, st, out_tail.join("\n"), tail));
-                return Err(format!("{} failed ({}). {}", name, st, tail.trim()));
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
         if cancel.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            crate::host::kill(&mut child);
             let _ = child.wait();
             say(&format!("stopped: {} (paused by the player)", name));
             return Ok(false);
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            crate::host::kill(&mut child);
+            let _ = child.wait();
+            say(&format!("stopped: {} (still running after {} s)", name, limit.unwrap_or_default().as_secs()));
+            return Err(format!("{} did not end in time", name));
         }
     }
 }
@@ -307,7 +321,8 @@ pub fn translate_missing(game_dir: &Path, tools_dir: &Path) -> Result<usize, Str
     if todo.is_empty() {
         return Ok(0);
     }
-    // the harness reads the code and control files relative to its manifest: absolute paths point it at RUNTIME_REL
+    // the harness reads the code and control files relative to its manifest: absolute paths (as the translator sees them)
+    // point it at RUNTIME_REL
     let input = cache_dir(game_dir).join("runtime_todo");
     let stage = cache_dir(game_dir).join("stage_missing");
     let _ = fs::remove_dir_all(&input);
@@ -318,7 +333,7 @@ pub fn translate_missing(game_dir: &Path, tools_dir: &Path) -> Result<usize, Str
         let mut f: Vec<String> = r.split('\t').map(String::from).collect();
         for k in [11, 12] {
             if let Some(v) = f.get_mut(k) {
-                *v = runtime.join(&*v).to_string_lossy().replace('\\', "/");
+                *v = crate::host::win_path(&runtime.join(&*v)).to_string_lossy().replace('\\', "/");
             }
         }
         text.push_str(&f.join("\t"));
@@ -326,10 +341,10 @@ pub fn translate_missing(game_dir: &Path, tools_dir: &Path) -> Result<usize, Str
     }
     fs::write(input.join("manifest.tsv"), text).map_err(|e| format!("cannot write {}: {}", input.display(), e))?;
     let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).to_string();
-    let mut cmd = Command::new(tools_dir.join("spirv_harness").join("spirv_harness.exe"));
-    cmd.arg("--batch").arg(&input).arg("--out").arg(&stage).args(["--jobs", &jobs, "--no-val"]);
+    let mut cmd = crate::host::windows_program(&tools_dir.join("spirv_harness").join("spirv_harness.exe"))?;
+    cmd.arg("--batch").arg(crate::host::win_path(&input)).arg("--out").arg(crate::host::win_path(&stage)).args(["--jobs", &jobs, "--no-val"]);
     cmd.env("DOTNET_gcServer", "1");
-    if !run_tool(cmd, &AtomicBool::new(false), false, None, |_| {})? {
+    if !run_tool(cmd, &AtomicBool::new(false), false, None, None, |_| {})? {
         return Err("the shader translator stopped".into());
     }
     let n = commit_stage(&stage, &spirv)?;
@@ -348,12 +363,13 @@ pub fn warm_up(game_dir: &Path, tools_dir: &Path, cancel: &AtomicBool) -> Result
     let scratch = cache_dir(game_dir).join("warmup");
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(scratch.join("save")).map_err(|e| format!("cannot create {}: {}", scratch.display(), e))?;
-    let mut cmd = Command::new(game_dir.join("pkp.exe"));
-    cmd.current_dir(game_dir).arg("--headless").args(["--max-seconds", &WARMUP_SECONDS.to_string()]).arg("--log").arg(scratch.join("warmup.log"));
+    let mut cmd = crate::host::windows_program(&game_dir.join("pkp.exe"))?;
+    cmd.current_dir(game_dir).arg("--headless").args(["--max-seconds", &WARMUP_SECONDS.to_string()]).arg("--log").arg(crate::host::win_path(&scratch.join("warmup.log")));
     // environment variables win over pkp.ini
-    cmd.env("NXRT_FS_SAVE_DIR", scratch.join("save")).env("NXRT_NVN_DUMP_MISSING", MISSING_REL).env("NXRT_AUDIO_SINK", "null");
-    // it ends with exit code 124 when the time is up: any end is fine, a crash only means fewer blocks were collected
-    if let Ok(false) = run_tool(cmd, cancel, false, None, |_| {}) {
+    cmd.env("NXRT_FS_SAVE_DIR", crate::host::win_path(&scratch.join("save"))).env("NXRT_NVN_DUMP_MISSING", MISSING_REL).env("NXRT_AUDIO_SINK", "null");
+    // it ends with exit code 124 when the time is up: any end is fine, a crash only means fewer blocks were collected. One
+    // still running 4 minutes later (a first Proton start also makes its prefix) is stopped.
+    if let Ok(false) = run_tool(cmd, cancel, false, None, Some(Duration::from_secs(WARMUP_SECONDS as u64 + 240)), |_| {}) {
         return Ok(None);
     }
     let n = translate_missing(game_dir, tools_dir)?;
@@ -401,7 +417,7 @@ pub fn run(job: &Job, tools: &Tools, cancel: &AtomicBool, mut report: impl FnMut
         let mut cmd = Command::new(&tools.python);
         cmd.arg("-I").arg(&tools.extract).arg("--romfs").arg(&job.romfs).arg("--main").arg(&job.main).arg("--out").arg(&corpus);
         cmd.args(["--jobs", &jobs, "--progress"]);
-        let ok = run_tool(cmd, cancel, job.idle, job.log.as_ref(), |l| {
+        let ok = run_tool(cmd, cancel, job.idle, job.log.as_ref(), None, |l| {
             if let Some(rest) = l.strip_prefix("scan: ") {
                 let mut it = rest.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
                 if let (Some(d), Some(t)) = (it.next(), it.next()) {
@@ -439,12 +455,12 @@ pub fn run(job: &Job, tools: &Tools, cancel: &AtomicBool, mut report: impl FnMut
         }
         drop(f);
         let _ = fs::remove_dir_all(&stage);
-        let mut cmd = Command::new(&tools.harness);
-        cmd.arg("--batch").arg(&corpus).arg("--out").arg(&stage).args(["--jobs", &jobs, "--no-val"]);
+        let mut cmd = crate::host::windows_program(&tools.harness)?;
+        cmd.arg("--batch").arg(crate::host::win_path(&corpus)).arg("--out").arg(crate::host::win_path(&stage)).args(["--jobs", &jobs, "--no-val"]);
         // server GC: with the default workstation GC each collection stops every worker (about 4x slower)
         cmd.env("DOTNET_gcServer", "1");
         let base = finished;
-        let ok = run_tool(cmd, cancel, job.idle, job.log.as_ref(), |l| {
+        let ok = run_tool(cmd, cancel, job.idle, job.log.as_ref(), None, |l| {
             // "  <n>/<count>  <s> s" every 500 blocks
             if let Some(n) = l.trim().split('/').next().and_then(|x| x.parse::<u64>().ok()) {
                 report(p("translate", base + n, total, format!("Translating shaders: {} of {}", base + n, total)));
