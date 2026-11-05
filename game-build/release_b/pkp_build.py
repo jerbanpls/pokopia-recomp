@@ -42,8 +42,11 @@ from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECOMP = os.path.join(HERE, 'recomp')
 SDK = os.path.join(HERE, 'sdk')
-ZIG = os.path.join(HERE, 'zig', 'zig.exe')
-FORMAT = 2          # bump when the build layout or the stamp changes: older builds (partial or done) are then started over
+# Windows: the bundled Zig. Linux (the native launcher): a Linux build of the same Zig version, which it fetches into
+# tools/linux/zig (PKP_ZIG overrides it); it cross-compiles the same x86_64-windows-gnu objects
+ZIG = (os.path.join(HERE, 'zig', 'zig.exe') if os.name == 'nt'
+       else os.environ.get('PKP_ZIG') or os.path.join(os.path.dirname(HERE), 'linux', 'zig', 'zig'))
+FORMAT = 2         # bump when the build layout or the stamp changes: older builds (partial or done) are then started over
 # the lifter as game-build/scripts/make-release.ps1 ships it: paths under RECOMP, the same in the zip (tools/build/recomp/...)
 # and in the repo (recomp/...)
 LIFTER = ['nxrecomp', 'include/nxrecomp', 'games/pkp/CMakeLists.txt', 'games/pkp/config.py']
@@ -201,8 +204,10 @@ def verify(exefs):
 
 
 def popen(cmd, **kw):
+    # creation flags are Windows-only; on Linux the launcher lowered this script's priority, which its children inherit
+    flags = CREATE_NO_WINDOW | BELOW_NORMAL if os.name == 'nt' else 0
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                            creationflags=CREATE_NO_WINDOW | BELOW_NORMAL, **kw)
+                            creationflags=flags, **kw)
 
 
 class Runner:
@@ -276,7 +281,16 @@ def lift(runner, exefs, gen, jobs):
 
 
 def free_memory():
-    """Available physical memory in bytes (Windows), or None."""
+    """Available physical memory in bytes (Windows, Linux), or None."""
+    if os.name != 'nt':
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
     try:
         import ctypes
 
