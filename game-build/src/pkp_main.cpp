@@ -49,6 +49,7 @@
 #include "nxrt/nup.h"
 #include "nxrt/nxmodule.h"
 #include "nxrt/runtime.h"
+#include "nxrt/services.h"
 
 #include "pkp/pkp_game.h"   // the Pokémon Pokopia game module (runtime/games/pkp): every title-specific table the runtime uses
 
@@ -113,6 +114,32 @@ std::unique_ptr<nxrt::gfx::Renderer> g_gfx_renderer;
 #endif
     TerminateProcess(GetCurrentProcess(), 1);
     for (;;) {}
+}
+
+// The game data is complete before the game starts: a RomFS that lacks files (most often an update dumped without the base game's files
+// under it) passes every earlier step and the game then fails when it reaches a missing file: a null read in its start-up (code 4, fork
+// #128). [fs] romfs_check = false skips this.
+void check_romfs() {
+    const nxrt::game::Info& gi = nxrt::game::info();
+    if (!gi.romfs_min_files || !nxrt::config_get_bool("fs", "romfs_check", true)) return;
+    const nxrt::services::RomfsSummary r = nxrt::services::romfs_summary();
+    if (!r.ok) {
+        const std::string msg = "The game data (RomFS) cannot be read: " + r.error +
+                                ". Choose your game files again in the Pokopia launcher (or set [fs] romfs in pkp.ini).";
+        die("%s", msg.c_str());
+    }
+    if (r.files >= gi.romfs_min_files && r.bytes >= gi.romfs_min_bytes) return;
+    const std::string base = nxrt::services::romfs_base_dir();
+    char msg[2048];
+    std::snprintf(msg, sizeof msg,
+                  "Your game data is incomplete, so %s cannot start: the RomFS in %s%s%s has %u files (%.2f GB), version %s has %u (%.2f GB).\n\n"
+                  "This happens when the update is dumped without the base game's files under it (an update only holds the files it changes), "
+                  "or when a copy of the romfs folder stopped early. Choose your game files again in the Pokopia launcher: with the base game "
+                  "in the same dump (base/romfs next to updates/) it adds the missing files itself. Otherwise dump the game again with the "
+                  "update merged into the base game.",
+                  gi.short_title, nxrt::services::romfs_dir().c_str(), base.empty() ? "" : " over ", base.c_str(), r.files,
+                  static_cast<double>(r.bytes) / 1e9, gi.version, gi.romfs_min_files, static_cast<double>(gi.romfs_min_bytes) / 1e9);
+    die("%s", msg);
 }
 
 std::wstring widen_utf8(const std::string& s) {
@@ -370,6 +397,8 @@ int main(int argc, char** argv) {
     NXLOG_I("boot", "Pokémon Pokopia %s: exefs '%s'", nxrt::game::info().version, exefs.c_str());
 
     if (prepare) return prepare_shaders_main(prepare_if_needed, prepare_threads, prepare_programs);
+
+    check_romfs();
 
     bool play_started = false;
     if (nxrt::config_get_bool("boot", "nvn", true)) {

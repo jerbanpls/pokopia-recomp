@@ -169,6 +169,9 @@ struct DisplaySettings {
     // [display] fps_limit (older name fps_cap): 0 = unlimited (with vsync on: mailbox presents), -1 = auto (the display's refresh rate),
     // else the cap; with vsync on, a cap only applies when it is below the refresh rate
     int fps_cap = 60;
+    // [display] fps_snap: "auto" (on for a detected Steam Deck only), "true" (on anywhere), "false" (off). With vsync on, a limit below the
+    // refresh rate then runs at an even divisor of it (40 -> 30 on 90 Hz). F1 "Cap FPS to 30 for Steam Deck" writes true / false.
+    std::string fps_snap = "auto";
     int width = 1280, height = 720;    // windowed client size, remembered
     bool keep_aspect = true;       // letterbox instead of stretching
     // ---- S10 display options (play_display.h). The first four only apply at the next start: the game builds its render targets once.
@@ -186,7 +189,8 @@ struct DisplaySettings {
     bool bloom = true;
     bool chromatic_aberration = true;
     // Games with quality hooks (play_game.h kDisplayOptQuality, live): the view distance multiplies the camera's far clip (1.0 .. 4.0, 1 = the
-    // console's), the preset names the set of values last picked on the F1 page (switch2, high, ultra; custom after a single change).
+    // console's), the preset names the set of values last picked on the F1 page (switch2, high, ultra, steamdeck, legion_go_s, laptop,
+    // desktop; custom after a single change, quality_presets() below).
     std::string quality_preset = "switch2";
     double view_distance = 1.0;
     // ---- S38 GPU paths, at the next start; [nvn] pool_mirror and pass_barriers in mpr.ini or the environment win over these.
@@ -197,6 +201,22 @@ struct DisplaySettings {
     // The display the window lives on, 1-based in the system's order; 0 = automatic (wherever the window opens). Applied live (the window moves).
     int monitor = 0;
 };
+
+// ---- quality presets ([display] quality_preset, the F1 Graphics page) ------------------------------------------------------------
+// The presets in the combo's order, "custom" last. The game's GamePlay::quality_preset hook writes their values. The picture presets
+// (switch2, high, ultra) set the view distance, texture LOD bias and anisotropy; the device presets (sets_frame) also set the render
+// scale and the frame limit. Changing one of the values the current preset set makes it custom (quality_preset_edited).
+struct QualityPresetInfo {
+    const char* id;       // the ini value, lowercase
+    const char* name;     // the combo's label
+    const char* about;    // one line for the tooltip: what it is for
+    bool sets_frame;      // also sets render_scale and fps_cap
+};
+const QualityPresetInfo* quality_presets(int* count);              // all of them, custom last
+const QualityPresetInfo* find_quality_preset(const std::string& id);   // case-insensitive; nullptr for an unknown id
+enum class QualityField : uint8_t { ViewDistance, LodBias, Anisotropy, RenderScale, FrameLimit };
+// The player changed `f` by hand: d.quality_preset becomes "custom" when the current preset set that value. True when it changed.
+bool quality_preset_edited(DisplaySettings& d, QualityField f);
 
 // ---- audio -------------------------------------------------------------------------------------------------------------------------
 struct AudioSettings {

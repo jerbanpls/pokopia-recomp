@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // NVN's driver constant bank c[0] as the GLSLC code reads it, filled from the current bindings for one draw or dispatch (no Vulkan,
-// no replay state: the replay hands in the ranges and handles, so the layout is unit-tested).
+// no replay state: the replay hands in the ranges and handles).
 //
 // Switch 2 compute programs keep a packed per-program table there, slot n = NVN binding n:
 //   0x00  16 header bytes (zero)

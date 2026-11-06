@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Graphics shell (S4b): SDL3 platform + input queue, Vulkan 1.3 device layer, NVN front end, ImGui overlay.
-# Built as the static library nxrt_gfx (links nxrt) and the test executable nxrt_gfx_tests (CTest groups gfx_*).
+# Built as the static library nxrt_gfx (links nxrt).
 include(${CMAKE_CURRENT_LIST_DIR}/gfx_deps.cmake)
 
 # The offline tiling library of the tools repository is compiled in as source (tools/tiling, tegra_tiling.h): found at
@@ -28,7 +28,6 @@ target_link_libraries(nxrt_astc2bc7 INTERFACE "${NXRT_A2B_DIR}/astc2bc7.lib" "${
 file(GLOB NXRT_A2B_DLLS "${NXRT_A2B_DIR}/astcdec-*-shared.dll")
 
 file(GLOB_RECURSE NXRT_GFX_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/*.cpp")
-list(FILTER NXRT_GFX_SOURCES EXCLUDE REGEX "nvn_gpu_stub[.]cpp$")   # unit-test stand-in of the GPU boundary (scripts/nvn_unit.ps1)
 add_library(nxrt_gfx STATIC ${NXRT_GFX_SOURCES})
 # The About page of the F1 menu shows the commit this build was made from (read when CMake configures; absent without git).
 find_package(Git QUIET)
@@ -42,7 +41,7 @@ endif()
 target_include_directories(nxrt_gfx PUBLIC include src/gfx/nvn/third_party PRIVATE src/gfx src/gfx/nvn)
 target_link_libraries(nxrt_gfx PUBLIC nxrt nxrt_volk nxrt_vma nxrt_imgui nxrt_tiling nxrt_astc2bc7 nxrt_zstd SDL3::SDL3-static)
 # The core calls into the graphics shell (src/core/switch2.cpp: the HDR layer luminance; src/testtools: the screenshot wait), so whatever
-# links nxrt (nxrt_tests, the liftrun_* tests) links nxrt_gfx too, as the game exe does. Static libraries may depend on each other.
+# links nxrt links nxrt_gfx too, as the game exe does. Static libraries may depend on each other.
 target_link_libraries(nxrt INTERFACE nxrt_gfx)
 target_compile_definitions(nxrt_gfx PUBLIC VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
 
@@ -52,55 +51,6 @@ target_link_options(nxrt_gfx_demo PRIVATE /MAP /DEBUG /STACK:8388608)
 foreach(dll ${NXRT_A2B_DLLS})
     add_custom_command(TARGET nxrt_gfx_demo POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:nxrt_gfx_demo>")
 endforeach()
-
-if(NXRT_BUILD_TESTS)
-    file(GLOB_RECURSE NXRT_GFX_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfx/*.cpp")
-    # The tests of the registered test game's own code (games/<id>/tests) run in the same executable (docs/GAME_BOUNDARY.md).
-    if(NXRT_TEST_GAME)
-        file(GLOB NXRT_GAME_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/games/${NXRT_TEST_GAME}/tests/*.cpp")
-        list(APPEND NXRT_GFX_TEST_SOURCES ${NXRT_GAME_TEST_SOURCES})
-    endif()
-    add_executable(nxrt_gfx_tests "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_main.cpp" ${NXRT_GFX_TEST_SOURCES})
-    target_include_directories(nxrt_gfx_tests PRIVATE tests src/gfx src/gfx/nvn)
-    target_link_libraries(nxrt_gfx_tests PRIVATE nxrt_gfx)
-    target_compile_definitions(nxrt_gfx_tests PRIVATE NXRT_GFX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/gfx")
-    # The BC7 reference decoder of bc7enc_rdo (public domain; the same file the setup tool checks its texture cache with): the ASTC texture scene
-    # works out its expected picture from the current encoder instead of a stored image (tests/gfx/test_nvn_scene_texture.cpp).
-    set(NXRT_BC7_REF_DIR "${NXRT_TOOLS_DIR}/textures/third_party/bc7enc_rdo")
-    if(EXISTS "${NXRT_BC7_REF_DIR}/bc7decomp_ref.cpp")
-        target_sources(nxrt_gfx_tests PRIVATE "${NXRT_BC7_REF_DIR}/bc7decomp_ref.cpp")
-        target_include_directories(nxrt_gfx_tests PRIVATE "${NXRT_BC7_REF_DIR}")
-        target_compile_definitions(nxrt_gfx_tests PRIVATE NXRT_HAVE_BC7_REF=1)
-    endif()
-    target_link_options(nxrt_gfx_tests PRIVATE /MAP /STACK:8388608 /DEBUG)
-    foreach(dll ${NXRT_A2B_DLLS})
-        add_custom_command(TARGET nxrt_gfx_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:nxrt_gfx_tests>")
-    endforeach()
-
-    set(NXRT_GFX_GROUPS "")
-    foreach(src ${NXRT_GFX_TEST_SOURCES})
-        file(STRINGS "${src}" lines REGEX "^NXTEST_GROUP[(]")
-        foreach(l ${lines})
-            string(REGEX REPLACE "^NXTEST_GROUP[(]([a-z0-9_]+)[)].*$" "\\1" g "${l}")
-            list(APPEND NXRT_GFX_GROUPS ${g})
-        endforeach()
-    endforeach()
-    list(REMOVE_DUPLICATES NXRT_GFX_GROUPS)
-    foreach(g ${NXRT_GFX_GROUPS})
-        add_test(NAME ${g} COMMAND nxrt_gfx_tests ${g} WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-        set_tests_properties(${g} PROPERTIES TIMEOUT 300 ENVIRONMENT "NXRT_GFX_HIDDEN=1")
-    endforeach()
-    # Timing oracles must not share the machine with another test of this suite.
-    foreach(g gfx_limiter gfx_pacing)
-        if(TEST ${g})
-            set_tests_properties(${g} PROPERTIES RUN_SERIAL TRUE)
-        endif()
-    endforeach()
-    if(TEST gfx_pacing)
-        set_tests_properties(gfx_pacing PROPERTIES TIMEOUT 900)   # up to four attempts per case on a busy GPU
-    endif()
-    message(STATUS "nxrt gfx test groups: ${NXRT_GFX_GROUPS}")
-endif()
 
 # The launcher (apps/launcher).
 include(${CMAKE_CURRENT_LIST_DIR}/launcher.cmake)

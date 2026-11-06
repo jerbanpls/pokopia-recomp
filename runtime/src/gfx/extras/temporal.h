@@ -58,11 +58,12 @@ bool temporal_camera_ready();   // a camera was kept since the last evaluation
 // slot 0 block that holds a valid camera: adds a Halton(2, 3) offset of the frame (8 phases, +-0.5 px of width x height) to the view-projection in
 // `words` (a copy the draw then binds). False: not a camera block, already jittered, or [upscale] jitter = 0.
 bool temporal_jitter_block(uint32_t* words, size_t n_words, uint32_t width, uint32_t height, uint64_t frame);
-// The tone-map draw: colour (view in SHADER_READ_ONLY_OPTIMAL) and depth (depth-aspect view, layout depth_layout) of the scene, both at least
-// `render` large; depth_neg_one: NVN depth mode NEAR_IS_MINUS_W (NDC z = 2 d - 1). Returns the result (`out` large, GENERAL layout, readable by
-// fragment shaders after the recorded barrier) or null (nothing recorded: the draw keeps its own input).
+// The tone-map draw: colour (view in SHADER_READ_ONLY_OPTIMAL) and depth (depth-aspect view, layout depth_layout) of the scene, the part of
+// them that is upscaled being `render` from texel 0, 0; depth_neg_one: NVN depth mode NEAR_IS_MINUS_W (NDC z = 2 d - 1). Returns the result
+// (`out` large, in the top-left of an image of out_tex when that is larger; GENERAL layout, readable by fragment shaders after the recorded
+// barrier) or null (nothing recorded: the draw keeps its own input).
 VkImageView temporal_evaluate(void* gfx_device, VkCommandBuffer cb, VkImageView color, VkImageView depth, VkImageLayout depth_layout, VkExtent2D render,
-                              VkExtent2D out, bool depth_neg_one);
+                              VkExtent2D out, bool depth_neg_one, VkExtent2D out_tex = {});
 
 // ---- backends --------------------------------------------------------------------------------------------------------------------
 // gfx_device: the gfx::Device. Null when the SDK cannot be loaded or the GPU does not support it (logged once).

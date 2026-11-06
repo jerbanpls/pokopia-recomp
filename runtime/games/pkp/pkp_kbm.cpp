@@ -21,7 +21,8 @@
 //     pointed at an empty function.
 //   * xbox / playstation: the same atlas sprites are overwritten with the pad icons of the prompt icon pack
 //     (assets/prompts/prompt_icons.pak: play::prompts_pack(); ps/cross for the button that presses Switch A, following [padmap]
-//     and [pad] label_abxy), so the prompts show the controller's own buttons instead of the game's Switch glyphs.
+//     and [pad] label_abxy), so the prompts show the controller's own buttons instead of the game's Switch glyphs. The four d-pad
+//     glyphs (left, right, up, down) get the d-pad with that arm lit (xbox/dpad_up ...).
 // The sprites are also looked up from the frame hook (pkp_play.cpp) once the sprite sheets are loaded, so the title screen and the HUD,
 // which draw them without a text tag, show the icons before the first tag.
 // The title screen's "PRESS (A) BUTTON" is not text: it is part of the title logo texture (a 1024x1024 BC7 texture loaded with the title
@@ -574,7 +575,10 @@ void sync_glyphs_locked(State& s) {
         Glyph& g = s.glyph[i];
         if (!g.tex) continue;
         std::string target = patch ? s.want[i].icon : std::string();
-        if (!target.empty() && !have_icon_locked(s, target)) target.clear();
+        if (!target.empty() && !have_icon_locked(s, target)) {
+            const std::string fb = play::pad_pack_fallback(target);   // an older pack without the d-pad directions: the whole d-pad
+            target = !fb.empty() && have_icon_locked(s, fb) ? fb : std::string();
+        }
         if (target == g.shown) continue;
         const void* tex = reinterpret_cast<const void*>(g.tex);
         if (!g.shown.empty()) {

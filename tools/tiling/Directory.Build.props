@@ -1,8 +1,0 @@
-<Project>
-  <!-- MIT License. Build products go to tools\tiling\build, never next to the sources (refs\ is read-only).
-       Adapted from the same pattern as tools\shaders\harness (SuperMarioWonderRecomp, MIT). -->
-  <PropertyGroup>
-    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)build/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath>
-    <BaseOutputPath>$(MSBuildThisFileDirectory)build/bin/</BaseOutputPath>
-  </PropertyGroup>
-</Project>

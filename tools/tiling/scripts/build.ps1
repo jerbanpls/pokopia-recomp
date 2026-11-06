@@ -1,4 +1,4 @@
-# Build tegra_tiling (library, tegra_tile CLI, tiling_test) with CMake + Ninja + clang-cl into tools\tiling\build\release.
+# Build tegra_tiling (library, tegra_tile CLI) with CMake + Ninja + clang-cl into tools\tiling\build\release.
 #   pwsh -File tools\tiling\scripts\build.ps1 [-Clean]
 param([switch]$Clean)
 $ErrorActionPreference = 'Stop'

@@ -60,6 +60,7 @@ bool heap_exists();
 bool heap_has_section();                        // false: private memory, no other views of the heap pages
 uint64_t heap_reserved();                       // section size
 bool heap_commit(uint64_t offset, uint64_t size);     // commit [kHeapBase+offset, +size) (page granularity)
+uint32_t heap_commit_error();                   // GetLastError of the last heap_commit that failed (0: none failed)
 bool heap_decommit(uint64_t offset, uint64_t size);
 uint64_t heap_committed();                      // bytes committed through heap_commit minus heap_decommit
 // Another view of section pages [offset, offset+size). offset and size must be multiples of kAllocGranularity.

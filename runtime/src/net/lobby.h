@@ -12,7 +12,7 @@
 //                  it over UDP to the relay's port (HELLO every 100 ms for 3 s, then every 5 s as keepalive / NAT refresh) and on the
 //                  first ACK switches the game datagrams to UDP both ways (UDP_MODE 1). No ACK for 15 s: back to TCP (UDP_MODE 0),
 //                  still probing. Until then, and whenever UDP is blocked, datagrams go over the TCP connection as in v2.
-//   LoopbackRelay  an in-process server with the relay's semantics (unit tests): client() hands out LoopbackLobby objects.
+//   LoopbackRelay  an in-process server with the relay's semantics: client() hands out LoopbackLobby objects.
 //
 // Room semantics (the server's): room R (1..254) is 169.254.R.0/24, the host is .1 (node 0), guests the lowest free .2...8 (node N-1),
 // node MAC 02:00:a9:fe:R:N. A datagram to .255 goes to every other member, never back to the sender; to a member's vIP, to that member.

@@ -6,7 +6,7 @@
 // The central idea is ONE frame boundary, tt::frame_boundary(), called once per game frame by whichever source is configured
 // ([test] frame_source): the game hook (an entry hook on CGameArchitectureSupport::Update, needs the site list in
 // tests/sites/mpr_testtools.sites compiled into the lifted game), the runtime's diag_frame_tick (the present path), an SVC counter
-// (bring-up: svc:N = a pseudo frame every N SVCs of the first guest thread) or the caller itself (unit tests). At each boundary:
+// (bring-up: svc:N = a pseudo frame every N SVCs of the first guest thread) or the caller itself (manual). At each boundary:
 //   1. the virtual clock steps (deterministic mode),
 //   2. the game state is read from guest memory (probes) and one trace line + state hash is written,
 //   3. the script runner / replay decides the pad for the next frame, a recorder notes the live pad,
@@ -93,7 +93,7 @@ const std::string& out_dir();
 // ---- the frame boundary ---------------------------------------------------------------------------------------------------------
 // `c` is the live context when called from a hook (needed only for @warp, which calls guest functions; the context is saved and restored).
 void frame_boundary(::Ctx* c = nullptr);
-// Unit tests: run with frame_source=manual and call this; `now` hooks are not registered. Resets everything (counters, files closed).
+// frame_source=manual: the caller calls this; `now` hooks are not registered. Resets everything (counters, files closed).
 void reset_for_tests();
 // Registers the game's entry hooks of the frame source and of the state-pointer capture (GameProbes::install_hooks).
 void install_game_hooks();

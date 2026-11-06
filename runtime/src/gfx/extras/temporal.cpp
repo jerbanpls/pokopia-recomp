@@ -353,7 +353,7 @@ bool temporal_camera_ready() {
 }
 
 VkImageView temporal_evaluate(void* gfx_device, VkCommandBuffer cb, VkImageView color, VkImageView depth, VkImageLayout depth_layout, VkExtent2D render,
-                              VkExtent2D out, bool depth_neg_one) {
+                              VkExtent2D out, bool depth_neg_one, VkExtent2D out_tex) {
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
     const UpscaleMode mode = upscale_mode();
@@ -379,7 +379,8 @@ VkImageView temporal_evaluate(void* gfx_device, VkCommandBuffer cb, VkImageView 
     TemporalBackend* be = mode == UpscaleMode::Fsr3 ? temporal_ffx(gfx_device) : temporal_dlss(gfx_device, mode == UpscaleMode::Dlaa);
     if (!be) return VK_NULL_HANDLE;
     if (!ensure(s, s.color, render, VK_FORMAT_R16G16B16A16_SFLOAT, "temporal colour") || !ensure(s, s.depth, render, VK_FORMAT_R32_SFLOAT, "temporal depth") ||
-        !ensure(s, s.motion, render, VK_FORMAT_R16G16_SFLOAT, "temporal motion") || !ensure(s, s.output, out, VK_FORMAT_R16G16B16A16_SFLOAT, "temporal output"))
+        !ensure(s, s.motion, render, VK_FORMAT_R16G16_SFLOAT, "temporal motion") || !ensure(s, s.output, VkExtent2D{std::max(out.width, out_tex.width), std::max(out.height, out_tex.height)}, VK_FORMAT_R16G16B16A16_SFLOAT,
+                "temporal output"))
         return VK_NULL_HANDLE;
 
     // jitter: the projection's offset in NDC -> pixels (FSR convention, picture +y down; NDC +y is the top row)
@@ -464,8 +465,15 @@ VkImageView temporal_evaluate(void* gfx_device, VkCommandBuffer cb, VkImageView 
     vkCmdDispatch(cb, (render.width + 7) / 8, (render.height + 7) / 8, 1);
     for (Target* t : {&s.color, &s.depth, &s.motion})
         barrier(cb, t->img.image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, any, rw);
+    const bool fresh_out = !s.output.ready;
     barrier(cb, s.output.img.image, s.output.ready ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, any, rw, any, rw);
     s.output.ready = true;
+    if (fresh_out && (out_tex.width > out.width || out_tex.height > out.height)) {   // a result image larger than out: zero it once (the draw that samples it may touch the texel past out; no NaN from undefined memory)
+        const VkClearColorValue zero{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, s.output.img.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+        barrier(cb, s.output.img.image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, any, rw);
+    }
 
     // the backend
     TemporalFrame f;

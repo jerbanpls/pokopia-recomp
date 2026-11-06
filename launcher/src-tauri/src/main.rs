@@ -16,6 +16,7 @@ mod settings;
 mod setuplog;
 mod shaders;
 mod update;
+mod writecheck;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -155,7 +156,10 @@ async fn import_nup(app: AppHandle, state: State<'_, Arc<SetupState>>, path: Str
     if state.progress.lock().unwrap().state == "running" {
         return Err("Setup is running. Pause it first.".into());
     }
-    let out = game_dir_of(&load_config(&app)).join("nup_dump");
+    let game_dir = game_dir_of(&load_config(&app));
+    let out = game_dir.join("nup_dump");
+    // a blocked folder fails here, in words, instead of halfway through with an OS error (writecheck.rs)
+    writecheck::check(&game_dir).map_err(|e| e.message())?;
     let src = PathBuf::from(path.trim());
     let emitter = app.clone();
     let st = state.inner().clone();
@@ -186,6 +190,11 @@ fn cancel_nup(state: State<Arc<SetupState>>) {
     state.nup_cancel.store(true, Ordering::SeqCst);
 }
 
+/// [fs] romfs_base for pkp.ini: the base romfs (relative to the game folder when inside it), or empty for none.
+fn base_value(game_dir: &Path, base: &str) -> String {
+    if base.is_empty() { String::new() } else { settings::portable(game_dir, base) }
+}
+
 #[tauri::command]
 fn validate_dump(path: String) -> dump::DumpReport {
     dump::scan(&path)
@@ -204,6 +213,7 @@ fn save_dump(app: AppHandle, path: String) -> Result<dump::DumpReport, String> {
         &[
             settings::Edit { file: "pkp".into(), section: "fs".into(), key: "exefs".into(), value: settings::portable(&game_dir_of(&cfg), &chosen.exefs) },
             settings::Edit { file: "pkp".into(), section: "fs".into(), key: "romfs".into(), value: settings::portable(&game_dir_of(&cfg), &chosen.romfs) },
+            settings::Edit { file: "pkp".into(), section: "fs".into(), key: "romfs_base".into(), value: base_value(&game_dir_of(&cfg), &chosen.romfs_base) },
         ],
     )?;
     Ok(report)
@@ -226,12 +236,12 @@ fn play(app: AppHandle) -> Result<(), String> {
         return Err("Choose your game files first (Setup).".into());
     }
     // a .nup package is played as it is: pkp reads exefs and romfs straight from it
-    let (exefs, romfs) = if cfg.dump_dir.trim().ends_with(".nup") && Path::new(cfg.dump_dir.trim()).is_file() {
-        (cfg.dump_dir.trim().to_string(), cfg.dump_dir.trim().to_string())
+    let (exefs, romfs, romfs_base) = if cfg.dump_dir.trim().ends_with(".nup") && Path::new(cfg.dump_dir.trim()).is_file() {
+        (cfg.dump_dir.trim().to_string(), cfg.dump_dir.trim().to_string(), String::new())
     } else {
         let report = dump::scan(&cfg.dump_dir);
         let chosen = report.chosen.ok_or_else(|| format!("The game files at {} are not usable: {}", cfg.dump_dir, report.errors.join(" ")))?;
-        (chosen.exefs, chosen.romfs)
+        (chosen.exefs, chosen.romfs, chosen.romfs_base)
     };
     let dir = game_dir_of(&cfg);
     let tools_dir = exe_dir().join("tools");
@@ -245,7 +255,14 @@ fn play(app: AppHandle) -> Result<(), String> {
     if !shaders::is_complete(&dir) {
         return Err("Finish the shader setup first (Game files, Set up).".into());
     }
-    settings::ensure_play_paths(&dir, &exefs, &romfs)?;
+    // the base game's files now fill in an update that lacks them (#128): its shaders were never extracted, so Set up runs once more
+    if !romfs_base.is_empty() {
+        let key = shaders::Job { game_dir: dir.clone(), romfs: PathBuf::from(&romfs), romfs_base: Some(PathBuf::from(&romfs_base)), main: PathBuf::new(), jobs: 1, idle: false, log: None, limit: 0 }.romfs_key();
+        if shaders::read_marker(&dir).romfs != key {
+            return Err("Your update holds only the files it changes, so the launcher now adds the missing ones from the base game. Run Set up again once (Game files, Set up) so their shaders are prepared too.".into());
+        }
+    }
+    settings::ensure_play_paths(&dir, &exefs, &romfs, &romfs_base)?;
     play::start(&app, &dir, cfg.minimize_on_play)
 }
 
@@ -301,6 +318,8 @@ fn start_setup(app: AppHandle, state: State<Arc<SetupState>>, gentle: Option<boo
     if !package_b && !dir.join("pkp.exe").is_file() {
         return Err(format!("pkp.exe was not found in {}. Put the launcher next to pkp.exe or set the game folder in Settings.", dump::fwd(&dir)));
     }
+    // the build, the shader tools and pkp.ini all write in the game folder: a blocked one fails here, in words (writecheck.rs)
+    writecheck::check(&dir).map_err(|e| e.message())?;
     {
         let mut p = state.progress.lock().unwrap();
         if p.state == "running" {
@@ -308,7 +327,7 @@ fn start_setup(app: AppHandle, state: State<Arc<SetupState>>, gentle: Option<boo
         }
         *p = shaders::Progress { state: "running".into(), phase: "check".into(), message: "Checking the setup tools...".into(), ..Default::default() };
     }
-    settings::ensure_play_paths(&dir, &chosen.exefs, &chosen.romfs)?;
+    settings::ensure_play_paths(&dir, &chosen.exefs, &chosen.romfs, &chosen.romfs_base)?;
     let st = state.inner().clone();
     st.cancel.store(false, Ordering::SeqCst);
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(3);
@@ -327,7 +346,8 @@ fn start_setup(app: AppHandle, state: State<Arc<SetupState>>, gentle: Option<boo
     ));
     log(&format!("game files: {}", dump::fwd(Path::new(&chosen.exefs))));
     let build_job = gamebuild::Job { game_dir: dir.clone(), exefs: PathBuf::from(&chosen.exefs), jobs: build_jobs, idle: gentle, log: Some(log.clone()) };
-    let job = shaders::Job { game_dir: dir, romfs: PathBuf::from(&chosen.romfs), main: PathBuf::from(&chosen.exefs).join("main"), jobs, idle: gentle, log: Some(log.clone()), limit: 0 };
+    let romfs_base = (!chosen.romfs_base.is_empty()).then(|| PathBuf::from(&chosen.romfs_base));
+    let job = shaders::Job { game_dir: dir, romfs: PathBuf::from(&chosen.romfs), romfs_base, main: PathBuf::from(&chosen.exefs).join("main"), jobs, idle: gentle, log: Some(log.clone()), limit: 0 };
     std::thread::spawn(move || {
         let mut last = (String::new(), 0u64, String::new());
         let mut emit = |p: shaders::Progress| {
@@ -360,7 +380,7 @@ fn start_setup(app: AppHandle, state: State<Arc<SetupState>>, gentle: Option<boo
             }
             let tools = shaders::find_tools(&tools_dir)?;
             // a finished cache of the same romfs has nothing left to translate (re-extracting would only find that out)
-            let same = shaders::read_marker(&job.game_dir).romfs == job.romfs.to_string_lossy().replace('\\', "/");
+            let same = shaders::read_marker(&job.game_dir).romfs == job.romfs_key();
             let done = same && shaders::is_complete(&job.game_dir);
             if !done && !shaders::run(&job, &tools, &st.cancel, |p| emit(p))? {
                 return Ok(false);

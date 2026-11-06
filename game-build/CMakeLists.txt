@@ -41,7 +41,6 @@ if(PKP_VERSION MATCHES "^([0-9]+)[.]([0-9]+)[.]([0-9]+)")
 endif()
 # PKP_RUNTIME_DIR: which runtime checkout compiles in (default the main one; a worktree such as runtime-wt/boot2 for branch work)
 set(PKP_RUNTIME_DIR "${PKP_ROOT}/runtime" CACHE PATH "runtime source tree compiled into pkp.exe")
-set(NXRT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NXRT_GAMES "pkp" CACHE STRING "" FORCE)            # runtime/games/pkp only
 set(NXRT_LAUNCHER_GAME "pkp" CACHE STRING "" FORCE)
 set(NXRT_RECOMP_INCLUDE "${PKP_ROOT}/recomp/include" CACHE PATH "")
@@ -79,7 +78,7 @@ set_source_files_properties(res/pkp.rc PROPERTIES COMPILE_DEFINITIONS "PKP_VER_M
                             OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/res/pkp.manifest")
 target_compile_definitions(pkp PRIVATE PKP_EXEFS_DEFAULT="${PKP_EXEFS_DEFAULT}")
 target_link_libraries(pkp PRIVATE pkp_main pkp_sdk pkp_subsdk0 pkp_rtld nxrt_game_pkp nxrt_gfx nxrt)   # nxrt_game_pkp: runtime/games/pkp
-# Same link options as the runtime's test executables: a linker map next to the exe (host frames get names), a big main stack (lifted
+# A linker map next to the exe (host frames get names), a big main stack (lifted
 # code nests deeply), low host allocations so the guest ranges at 0x71_0000_0000 and up stay free.
 if(PKP_RELEASE)
     target_compile_definitions(pkp PRIVATE PKP_GUI_SUBSYSTEM=1)

@@ -21,6 +21,8 @@ struct LiveStatus {
     double fps = 0;                    // presented frames per second (measured over the last second)
     const char* present_mode = "";     // "fifo" "mailbox" "immediate" ...
     const char* window_mode = "";      // "windowed" "borderless" "exclusive" (what the window is, not what the settings ask)
+    int snap_k = 0;                    // the frame limit runs at the refresh rate / snap_k (0: not snapped)
+    double snap_cap = 0;               // that rate
     float refresh_hz = 0;              // refresh rate of the display the window is on
     int width = 0, height = 0;         // window size in pixels
     EngineOut out;                     // what the keyboard and mouse press on the Switch pad right now

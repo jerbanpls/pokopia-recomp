@@ -68,4 +68,18 @@ namespace accapi {
 void user_uid(uint64_t* hi, uint64_t* lo);   // the one local user (profile())
 }
 
+// ---- ldn (ldn.cpp) ----------------------------------------------------------------------------------------------------------------
+// Session variant: a gameplay change every player of a Link Play session must share (a game module's opt-in mod). 0 = none (the game as
+// shipped), 1..7 = the game module's own meaning. It rides in the room's local communication version, which the relay already compares on
+// JOIN (bits 12..14: wire = version | variant << 12; the game's own version stays in bits 0..11 and is all the game ever sees), so peers
+// with another variant, or an older build without variants, are refused like a version mismatch (the relay protocol is unchanged).
+// `what` names the game module's setting for the log ("Interact everywhere"), also with variant 0, so a refusal can say what the host has
+// on. Set it before the game creates or joins a network; any thread.
+namespace ldnapi {
+constexpr int kVariantShift = 12;
+constexpr uint16_t kVariantMask = 0x7000;
+void set_session_variant(uint8_t variant, const char* what);
+uint8_t session_variant();
+}  // namespace ldnapi
+
 }  // namespace nxrt::services

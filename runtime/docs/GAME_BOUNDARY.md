@@ -42,9 +42,9 @@ a superset of the one before, so each program links only what it needs:
 
 | Library | Adds | Registered by | Linked by |
 | --- | --- | --- | --- |
-| `nxrt_game_mpr_data` | identity, names, factory settings (pure data) | `nxrt_register_game_mpr_data()` | the launcher and its tests |
-| `nxrt_game_mpr_core` | title profile, timestep sites, test probes (links nxrt) | `nxrt_register_game_mpr_core()` | `nxrt_tests` |
-| `nxrt_game_mpr` | play-mode hooks, prompts (links nxrt_gfx and the pak reader) | `nxrt_register_game_mpr()` | `mpr.exe`, `nxrt_gfx_tests` |
+| `nxrt_game_mpr_data` | identity, names, factory settings (pure data) | `nxrt_register_game_mpr_data()` | the launcher |
+| `nxrt_game_mpr_core` | title profile, timestep sites, test probes (links nxrt) | `nxrt_register_game_mpr_core()` | `nxrt_game_mpr` |
+| `nxrt_game_mpr` | play-mode hooks, prompts (links nxrt_gfx and the pak reader) | `nxrt_register_game_mpr()` | `mpr.exe` |
 
 The play-mode half talks to the base through two tables in `src/gfx/play/play_game.h`. `GamePlay` is what the game gives the base
 (function pointers: `install_render`, `install`, `remove`, `settings_changed`, `frame_begin`, `frame`, `display_live`, `menu_*`,
@@ -53,8 +53,8 @@ The play-mode half talks to the base through two tables in `src/gfx/play/play_ga
 handling, aim feedback, pitch limit, log status). Hooks keep their registration order: the base installs the game's render hooks
 before its own frame hook and the game's input hooks after it, as before.
 
-CMake: `NXRT_BUILD_GAMES` (on) adds every module listed in `NXRT_GAMES` (default `mpr`), so a second game needs no edit of the base. `NXRT_TEST_GAME` (mpr) picks the module the test programs register.
-Its tests run in the base test programs: `games/<id>/tests/core/*.cpp` in `nxrt_tests`, `games/<id>/tests/*.cpp` in `nxrt_gfx_tests`; without a test game they are left out. `NXRT_LAUNCHER_GAME` (mpr) picks the launcher's branding and its `games/<id>/launcher.rc`; when that module is not built, the launcher builds unbranded. The setup tool has `MPRS_GAME` (mpr) and
+CMake: `NXRT_BUILD_GAMES` (on) adds every module listed in `NXRT_GAMES` (default `mpr`), so a second game needs no edit of the base.
+`NXRT_LAUNCHER_GAME` (mpr) picks the launcher's branding and its `games/<id>/launcher.rc`; when that module is not built, the launcher builds unbranded. The setup tool has `MPRS_GAME` (mpr) and
 the release builder reads `tools/release/games/<id>.json` (`MPR_RELEASE_GAME`, default mpr).
 
 ## The audit
@@ -159,9 +159,6 @@ These are still Metroid-shaped in the base. None of them blocks a second game fr
 - Test tooling vocabulary. `tt::GameState` fields (morph, beam, visor, missiles), the hash over them (`tt_core.cpp`) and the item
   names in `tt_script.cpp`.
 - Launcher names. Target `mpr_launcher`, library `mpr_launcher_core`, namespace `mprl`, window class `MprLauncherWindow`.
-- Base tests register the Metroid module. The service, tt and play tests of the base run with `NXRT_TEST_GAME=mpr`;
-  the tests that use Metroid sites or hooks directly (timestep, play aim, lock-on, look rate, display hooks, play hook, camera look) are
-  in `games/mpr/tests` and `games/mpr/tests/core`.
 - Setup tool. The texture and program stages read Retro's formats; the version resources and the window class name are Metroid's.
 - Release templates (README, HELP) and the release's licence notice name the game.
 - Docs. Older docs (S*.md) and CONFIG.md still give the old paths of the moved files.

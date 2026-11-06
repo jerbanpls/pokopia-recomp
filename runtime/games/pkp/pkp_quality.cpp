@@ -19,7 +19,8 @@
 // logs the quality fields once per distinct set. None of them is changed here (their renderer readers are not confirmed).
 //
 // Texture sharpness: the renderer's own sampler tuning ([display] lod_bias, anisotropy, play_display.cpp) on every NVN sampler. A
-// [pkp] quality_preset in the ini or the environment wins over the F1 page's values at start and after every settings change.
+// [pkp] quality_preset in the ini or the environment wins over the F1 page's values at start and after every settings change (view
+// distance and texture values only: a device preset's render scale and frame limit come from the F1 page's [display] values).
 //
 // Fog strength ([pkp] fog_strength, 0 .. 1.5, 1 = the console). The height-fog pass (fragment shader 7c8c05da24a1f5a2, a full-screen pass
 // after lighting) blends three fog layers over the scene: per layer i, factor = (1 - exp(-ramp^2)) * clamp(c3[i].w, 0, 1) * distance ramp,
@@ -68,12 +69,21 @@ struct Preset {
     double view_distance;
     double lod_bias;
     int anisotropy;
+    bool frame;          // a device preset: also sets the render scale and the frame limit
+    int render_scale;    // [display] render_scale (0 = auto: the window's size, never below 1080p off a handheld)
+    int fps_cap;         // [display] fps_limit (-1 = the display's refresh rate)
 };
-// switch2 = the console's picture; the PC presets push the far clip and the texture sharpness.
+// switch2 = the console's picture; the PC presets push the far clip and the texture sharpness. The device presets (#122) also pick a
+// render scale and a frame limit for the machine (100 = 1920 x 1080). Model LOD distance follows the view distance (apply). Upscalers stay
+// off; fog ([pkp] fog_strength) is the console's.
 constexpr Preset kPresets[] = {
-    {"switch2", 1.0, 0.0, 0},
-    {"high", 1.5, -0.5, 8},
-    {"ultra", 2.0, -1.0, 16},
+    {"switch2", 1.0, 0.0, 0, false, 0, 0},
+    {"high", 1.5, -0.5, 8, false, 0, 0},
+    {"ultra", 2.0, -1.0, 16, false, 0, 0},
+    {"steamdeck", 1.0, 0.0, 4, true, 75, 40},     // 1440 x 810 for the 1280 x 800 screen; 40 fps: runs at 40 where the refresh is a multiple (80 Hz OLED / 40 Hz LCD in Steam's Performance menu), else at 30 (90 Hz OLED default)
+    {"legion_go_s", 1.25, 0.0, 8, true, 80, 60},  // 1536 x 864 for the 1920 x 1200 screen, 60 fps
+    {"laptop", 1.0, 0.0, 4, true, 75, 60},        // integrated / entry graphics: fewer pixels, 60 fps
+    {"desktop", 2.0, -0.5, 16, true, 0, -1},      // a dedicated GPU: the window's size (at least 1080p), the display's refresh rate
 };
 
 const Preset* find_preset(const std::string& n) {
@@ -388,6 +398,10 @@ bool quality_preset(const char* name, play::DisplaySettings& d) {
     d.view_distance = p->view_distance;
     d.lod_bias = p->lod_bias;
     d.anisotropy = p->anisotropy;
+    if (p->frame) {
+        d.render_scale = p->render_scale;
+        d.fps_cap = p->fps_cap;
+    }
     d.quality_preset = p->name;
     return true;
 }
@@ -399,7 +413,7 @@ void quality_install(uint64_t base, const play::Settings& set) {
     if (config_has("pkp", "quality_preset")) {
         const std::string n = config_get_str("pkp", "quality_preset", "switch2");
         s.ini_preset = find_preset(n);
-        if (!s.ini_preset) NXLOG_W(kTag, "quality: [pkp] quality_preset '%s' is not switch2, high or ultra: ignored", n.c_str());
+        if (!s.ini_preset) NXLOG_W(kTag, "quality: [pkp] quality_preset '%s' is not switch2, high, ultra, steamdeck, legion_go_s, laptop or desktop: ignored", n.c_str());
     }
     if (config_has("pkp", "view_distance")) {
         s.ini_view_set = true;

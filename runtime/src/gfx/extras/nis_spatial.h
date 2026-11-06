@@ -24,7 +24,7 @@ public:
     bool initialised() const { return dev_ != nullptr; }
 
     VkImageView upscale(VkCommandBuffer cb, VkImageView src, VkExtent2D in_view, VkExtent2D in_tex, VkExtent2D out, bool linear_hdr, float prescale,
-                        float sharpness) override;
+                        float sharpness, VkExtent2D out_tex = {}) override;
     bool supports(VkExtent2D in_view, VkExtent2D out) const override;
     uint32_t frames() const { return frames_; }
 

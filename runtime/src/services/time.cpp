@@ -9,23 +9,36 @@
 // Model (one process-wide state, guarded by one mutex):
 //   * posix time of a clock = host UTC (GetSystemTimePreciseAsFileTime) + that clock's offset. The user and the local clock share the
 //     local offset (on the console the user clock is the local clock); the network and the ephemeral network clock have their own.
-//   * steady clock: ticks since start-up (kernel::system_tick, 19.2 MHz, 1 tick = 625/12 ns) + a fixed epoch of 3600 s + the internal
-//     offset + the test offset (both in ns, TimeSpanType). Seconds are the floor of that sum; the sequence is monotonic.
+//   * steady clock: ticks since start-up (kernel::system_tick, 19.2 MHz, 1 tick = 625/12 ns) + the base + the internal offset + the
+//     test offset (both in ns, TimeSpanType). The base is the host RTC value at start-up (seconds since 2000-01-01, as GetRtcValue),
+//     so the steady clock carries on across runs like the console's, which is RTC-backed and survives reboots: a SteadyClockTimePoint
+//     the game saved in an earlier run still measures real elapsed time. Seconds are the floor of the sum; the sequence is monotonic.
 //   * every change of an offset rewrites the shared memory, so the guest's fast GetCurrentTime path sees the same values.
 //
 // Time shared memory (0x1000 bytes, offsets as TimeSharedMemory.cs writes them). A block is a u32 index at `off`, `pad` bytes, then two
 // slots; the live slot is (index & 1). Writers bump the index after writing the free slot.
-//   0x000 SteadyClockContext x2 (pad 4; slots 0x008, 0x020; 0x18 each): u64 internal_offset (= epoch + internal + test, ns), uuid source
+//   0x000 SteadyClockContext x2 (pad 4; slots 0x008, 0x020; 0x18 each): u64 internal_offset (= steady time - raw tick time, ns), uuid
 //   0x038 Local SystemClockContext x2 (pad 4; slots 0x040, 0x060; 0x20 each): i64 offset, {i64 time_point, uuid}
 //   0x080 Network SystemClockContext x2 (pad 4; slots 0x088, 0x0A8)
 //   0x0C8 automatic correction flag x2 (pad 0; slots 0x0CC, 0x0CD; 1 byte each)
-//   0x0D0 ContinuousAdjustmentTimePoint x2 (pad 4; slots 0x0D8, 0x110; 0x38 each): u64 clock_offset (= start tick in ns),
-//         i64 multiplier (1), i64 divisor_log2 (0), SystemClockContext {offset 0, {time_point 0, uuid}}
+//   0x0D0 ContinuousAdjustmentTimePoint x2 (pad 4; slots 0x0D8, 0x110; 0x38 each), see Adjust below.
 // The user clock has no slot of its own (the layout of the console has none): it is the local context.
+//
+// Which block the game reads: Pokopia's SDK (nn::time::detail::SharedMemoryClient in the sdk module) does NOT read the steady
+// context at 0x000 any more. GetStandardSteadyClockCurrentTimePoint, CalculateSystemClockCurrentTime and ...CurrentTimespec all take
+// the steady time from the ContinuousAdjustmentTimePoint (disassembly, sdk +0x557160, +0x5572c0, +0x5576c0):
+//     raw  = ConvertToTimeSpan(GetSystemTick())                  (ns since host boot here: QueryPerformanceCounter)
+//     adj  = base_offset + (((raw - clock_offset) * multiplier) >> divisor_log2)
+//     adj  = multiplier < 0 ? max(adj, limit_offset) : min(adj, limit_offset)
+//     steady = (raw + adj) / 1e9 s,  posix = context.offset + steady   (context and adjustment uuids must match)
+// i.e. the adjustment slews from base_offset towards limit_offset. Ryubing's layout names (and our old values: multiplier 1,
+// base 0, limit 0) gave adj = 0, so the game's steady clock was the raw host counter: every local time it showed was off by
+// (host counter at start-up - the runtime's steady time), +29 h on a handheld up for a day, -52 min on one rebooted 8 min before.
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,6 +56,7 @@
 
 #include "nxrt/config.h"
 #include "nxrt/kernel.h"
+#include "nxrt/log.h"
 #include "nxrt/tt.h"
 #include "services_internal.h"
 #include "timezone.h"
@@ -51,9 +65,11 @@ namespace nxrt::services {
 namespace {
 
 // ---- constants ----------------------------------------------------------------------------------------------------------------
-constexpr uint64_t kSteadyEpochSeconds = 3600;                          // fixed epoch offset of the steady clock (this runtime's choice)
-constexpr uint64_t kSteadyEpochNs = kSteadyEpochSeconds * 1000000000ull;
-constexpr uint8_t kSourceId[16] = {'n', 'x', 'r', 't', '-', 's', 't', 'e', 'a', 'd', 'y', '-', 'c', 'l', 'k', '1'};   // clock_source_id
+constexpr int64_t kMinSteadyBaseSeconds = 3600;                         // floor of the steady base (a host clock set before 2000)
+// clock_source_id. "clk1" was a steady clock that restarted at 3600 s every run (and the game read the raw host counter instead):
+// time points saved under it measure nothing. The RTC-based clock gets a new id, so the game sees those as another clock's (as after
+// an RTC reset on the console) instead of computing spans against them.
+constexpr uint8_t kSourceId[16] = {'n', 'x', 'r', 't', '-', 's', 't', 'e', 'a', 'd', 'y', '-', 'c', 'l', 'k', '2'};
 constexpr uint32_t kShmSize = 0x1000;
 constexpr int64_t kRtcEpochUnix = 946684800;                            // 2000-01-01T00:00:00Z in posix seconds (RTC counts from here)
 
@@ -90,11 +106,15 @@ struct SysCtx {
     int64_t time_point;
     uint8_t source[16];
 };
+// nn::time ContinuousAdjustmentTimePoint as Pokopia's SDK reads it (see the top of the file). Ryubing declares the last 0x20 bytes
+// as a SystemClockContext; the SDK reads them as two adjustment bounds and the uuid.
 struct Adjust {
-    uint64_t clock_offset;
-    int64_t multiplier;
-    int64_t divisor_log2;
-    SysCtx ctx;
+    uint64_t clock_offset;     // raw tick time (ns) where the slew starts
+    int64_t multiplier;        // slew rate numerator (0: a fixed offset)
+    int64_t divisor_log2;      // slew rate denominator, as a shift
+    int64_t base_offset;       // steady - raw (ns) at clock_offset
+    int64_t limit_offset;      // steady - raw (ns) the slew stops at
+    uint8_t source[16];
 };
 static_assert(sizeof(SteadyCtx) == 0x18);
 static_assert(sizeof(SysCtx) == 0x20);
@@ -104,6 +124,7 @@ static_assert(sizeof(Adjust) == 0x38);
 struct State {
     bool created = false;
     uint64_t tick0_ns = 0;                                // raw tick at start-up, in ns (the ContinuousAdjustment clock_offset)
+    int64_t base_ns = 0;                                  // steady time at start-up: the host RTC value then, in ns
     int64_t internal_ns = 0, test_ns = 0;                 // steady clock offsets (TimeSpanType, ns)
     int64_t local_delta = 0, network_delta = 0, ephemeral_delta = 0;   // seconds added to host UTC per clock
     bool auto_correction = false;
@@ -153,9 +174,11 @@ int64_t host_unix_now() {
 #endif
 }
 
-int64_t steady_total_ns(const State& s) {
-    return static_cast<int64_t>(raw_ticks_ns() - s.tick0_ns) + static_cast<int64_t>(kSteadyEpochNs) + s.internal_ns + s.test_ns;
-}
+// Steady time minus raw tick time (ns): what the guest adds to the raw tick to read the steady clock. Negative once the host counter
+// is past the steady time; the SDK adds it as a signed value.
+int64_t steady_minus_raw_ns(const State& s) { return s.base_ns + s.internal_ns + s.test_ns - static_cast<int64_t>(s.tick0_ns); }
+
+int64_t steady_total_ns(const State& s) { return static_cast<int64_t>(raw_ticks_ns()) + steady_minus_raw_ns(s); }
 int64_t steady_secs(const State& s) { return steady_total_ns(s) / 1000000000; }
 
 struct Now {
@@ -198,9 +221,15 @@ void ensure_hosts(State& s) {
     s.utc_rule.assign(tz::kRuleSize, 0);
     tz::make_utc_rule(s.utc_rule.data());
     std::string name;
-    tz::make_host_rule(s.host_rule.data(), &name);
+    const bool built = tz::make_host_rule(s.host_rule.data(), &name);
     s.host_name = name.empty() ? std::string("UTC") : name;
     s.hosts_ready = true;
+    tz::CalendarTime c{};
+    tz::CalendarAdditionalInfo i{};
+    const bool ok = tz::to_calendar(s.host_rule.data(), static_cast<int64_t>(std::time(nullptr)), &c, &i);
+    NXLOG_I("time", "host time zone %s (%s): now %04d-%02d-%02d %02d:%02d %.8s, UTC%+d s%s", s.host_name.c_str(),
+            built ? "rule built" : "no host rule, using UTC", c.year, c.month, c.day, c.hour, c.minute, i.tz_name, i.utc_offset,
+            ok ? "" : " (conversion failed)");
 }
 const uint8_t* device_rule(State& s) {
     ensure_hosts(s);
@@ -242,8 +271,11 @@ void write_shm(State& s) {
     if (!b) return;
     const Now n = now_of(s);
 
+    const int64_t steady_minus_raw = steady_minus_raw_ns(s);
+
+    // Older SDKs read the steady clock as internal_offset + the raw tick in ns (Ryubing TimeSharedMemory.SetupStandardSteadyClock).
     SteadyCtx sc{};
-    sc.internal_offset = static_cast<uint64_t>(static_cast<int64_t>(kSteadyEpochNs) + s.internal_ns + s.test_ns);
+    sc.internal_offset = static_cast<uint64_t>(steady_minus_raw);
     std::memcpy(sc.source, kSourceId, 16);
     lifo_write(b, kOffSteady, kPadSteady, &sc, sizeof sc);
 
@@ -255,17 +287,23 @@ void write_shm(State& s) {
     const uint8_t ac = s.auto_correction ? 1 : 0;
     lifo_write(b, kOffAutoCorr, kPadAutoCorr, &ac, 1);
 
+    // Pokopia's SDK reads the steady clock here (top of the file): no slew, the offset fixed at steady - raw from the start tick on, so
+    // the guest's steady time is the runtime's and context.offset + it is the clock's posix time.
     Adjust adj{};
     adj.clock_offset = s.tick0_ns;
-    adj.multiplier = 1;
+    adj.multiplier = 0;
     adj.divisor_log2 = 0;
-    std::memcpy(adj.ctx.source, kSourceId, 16);
+    adj.base_offset = steady_minus_raw;
+    adj.limit_offset = steady_minus_raw;
+    std::memcpy(adj.source, kSourceId, 16);
     lifo_write(b, kOffAdjust, kPadAdjust, &adj, sizeof adj);
 }
 
 // Start-up state: every offset zero, the start tick taken now, the shared memory zeroed and written once.
 void init_locked(State& s) {
     s.tick0_ns = raw_ticks_ns();
+    const int64_t rtc = host_unix_now() - kRtcEpochUnix;
+    s.base_ns = (rtc > kMinSteadyBaseSeconds ? rtc : kMinSteadyBaseSeconds) * 1000000000ll;
     s.internal_ns = 0;
     s.test_ns = 0;
     s.local_delta = 0;
@@ -283,6 +321,9 @@ void init_locked(State& s) {
         std::memset(b, 0, kShmSize);
         write_shm(s);
     }
+    NXLOG_I("time", "steady clock: %lld s at start-up (host RTC base), host counter %llu s, the game adds %lld ns to it",
+            static_cast<long long>(steady_secs(s)), static_cast<unsigned long long>(s.tick0_ns / 1000000000ull),
+            static_cast<long long>(steady_minus_raw_ns(s)));
 }
 
 // Lazily brings the state up (the shared memory needs the kernel region, so nothing is allocated before the first service use).
@@ -516,6 +557,8 @@ std::shared_ptr<ipc::Service> make_tz(uint32_t perm) {
             tz::CalendarTime cal{};
             tz::CalendarAdditionalInfo info{};
             if (!tz::to_calendar(device_rule(state_locked()), posix, &cal, &info)) return err_tz_conversion();
+            NXLOG_T("time", "ToCalendarTimeWithMyRule(%lld) -> %04d-%02d-%02d %02d:%02d:%02d %.8s UTC%+d s", static_cast<long long>(posix),
+                    cal.year, cal.month, cal.day, cal.hour, cal.minute, cal.second, info.tz_name, info.utc_offset);
             rsp.push(cal);
             rsp.push(info);
             return 0;
@@ -537,6 +580,9 @@ std::shared_ptr<ipc::Service> make_tz(uint32_t perm) {
             int64_t times[2] = {0, 0};
             int n = tz::to_posix(device_rule(state_locked()), cal, times);
             if (n < 0 || n > 2) n = 0;
+            NXLOG_T("time", "ToPosixTimeWithMyRule(%04d-%02d-%02d %02d:%02d:%02d) -> %d: %lld %lld (out buffer %llu bytes)", cal.year,
+                    cal.month, cal.day, cal.hour, cal.minute, cal.second, n, static_cast<long long>(times[0]),
+                    static_cast<long long>(times[1]), static_cast<unsigned long long>(req.out_buf(0).size));
             if (n > 0) buf_write(req.out_buf(0), times, static_cast<uint64_t>(n) * 8);
             rsp.push<uint32_t>(static_cast<uint32_t>(n));
             return 0;

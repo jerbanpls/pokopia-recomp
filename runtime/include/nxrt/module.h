@@ -83,10 +83,15 @@ public:
     const RelocStats& stats() const { return stats_; }
     // Names the nearest preceding symbol: "name+0x10" or empty.
     std::string describe(uint64_t addr) const;
+    // The NSO header's 32-byte module id (the build id) as 64 lowercase hex digits; empty for a module not loaded from an NSO. Code that
+    // hooks one build of a module checks it (game modules: hook sites are offsets of one build).
+    const std::string& build_id() const { return build_id_; }
+    void set_build_id(const uint8_t (&id)[32]);
 
 private:
     friend struct LoaderAccess;
     std::string name_;
+    std::string build_id_;
     uint64_t base_ = 0, size_ = 0, entry_ = 0;
     uint64_t bias_ = 0;        // added to every ELF virtual address (ET_DYN: the load base; ET_EXEC: 0)
     bool linked_ = false;

@@ -60,6 +60,13 @@ struct Info {
     const char* shader_pack = "";           // the shader pack file next to the setup tool: "shader_cache.mprshc"
     const char* save_folder = "";           // save data folder under %APPDATA%: "MPRRecomp" (empty: "nxrt")
 
+    // ---- game data ----
+    // The RomFS of the supported version holds at least this many files and bytes (0: not checked). A RomFS with less is missing files and
+    // the game fails at an unpredictable point when it reaches one (a null read at start for Pokopia, fork #128), so the exe stops at start
+    // with a message instead. Extra files (desktop.ini and the like) pass.
+    uint32_t romfs_min_files = 0;
+    uint64_t romfs_min_bytes = 0;
+
     // ---- tables (null = the feature is off) ----
     void (*title_defaults)(services::TitleProfile& p) = nullptr;
     const timestep::Sites* timestep = nullptr;

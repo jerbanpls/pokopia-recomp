@@ -109,6 +109,10 @@ const game::Info& data_info() {
         g.game_ini = "pkp.ini";
         g.shader_pack = "shader_cache.pkpshc";
         g.save_folder = "PokopiaRecompPC";
+        // 2.0.1a (update 655360) merged over the base game: 36 files, 8 folders, 7,246,052,773 bytes in every complete dump seen in the issue
+        // logs (#44, #47, #49, #69, #76, #95, #119). Keep in step with game-build/release_b/dump_hashes.json "romfs".
+        g.romfs_min_files = 36;
+        g.romfs_min_bytes = 7246052773ull;
         g.play_defaults = &game_defaults();   // the launcher writes and resets controls.ini from these too
         return g;
     }();

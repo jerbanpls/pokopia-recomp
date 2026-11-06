@@ -347,7 +347,10 @@ NVNsyncWaitResult nvnSyncWait(const NVNsync* sync, uint64_t timeout_ns) {
     const be::Sync* s = be::host_of<be::Sync>(sync);
     if (!s || !s->armed.load()) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     const uint64_t serial = s->serial.load();
-    if (serial == 0 || be::gpu::serial_done(serial)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    // timeout 0 is the guest polling (acquire sync, queue fence, plain polls): [nvn] poll_flush decides when such a poll flushes the batch.
+    const bool poll = timeout_ns == 0;
+    if (serial == 0 || be::gpu::serial_done(serial, poll ? be::gpu::PollKind::Sync : be::gpu::PollKind::Wait)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (poll) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     return be::gpu::wait_serial(serial, timeout_ns) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED
                                                     : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }

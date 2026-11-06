@@ -1,9 +1,6 @@
 # tools/test: test tooling and Eden reference captures (work area S5)
 
-Host-side half of the test tooling. The runtime half (scripted runs, traces, deterministic mode, record/replay) is `runtime/docs/S5.md`. Python is `tools\.venv\Scripts\python` (numpy and Pillow only); tests are stdlib `unittest`:
-
-    cd tools\test
-    ..\.venv\Scripts\python -I -m unittest discover -s tests -v        everything below (163 tests, no game needed)
+Host-side half of the test tooling. The runtime half (scripted runs, traces, deterministic mode, record/replay) is `runtime/docs/S5.md`. Python is `tools\.venv\Scripts\python` (numpy and Pillow only).
 
 ## Scripted runs against mpr.exe
 
@@ -12,7 +9,7 @@ Host-side half of the test tooling. The runtime half (scripted runs, traces, det
 | `run_suite.py SUITE.toml [--only a,b] [--tag t] [--exe path] [--jobs N] [--list]` | Runs each `[[run]]` of a suite against the game exe headless and prints one PASS/FAIL table (PASS, FAIL, CRASH, FREEZE, TIMEOUT, ERROR). Exit code 0 only when every run passes. A run can repeat (the final hashes must match), compare its trace with a reference (`ref_trace`), compare screenshots (`ref_shots`) and expect failure (`expect_exit = 1`). Format and exit-code contract: top of the file. |
 | `suites/boot.toml`, `scripts/*.nxs` | What runs today (bring-up determinism) and the first gameplay script (warp to the Frigate, walk). The DSL is documented in `runtime/include/nxrt/tt_script.h`. |
 | `regions.tsv`, `gen_regions.py` | World and area names for `@warp` / `@area`, generated from the practice mod's `RegionEntries.h` (284 rows). |
-| `phys_table.py --exe DIR [--rates 60,120,144,240] [--scenarios walk,half,jump,rjump,ball] [--tag t]` | Physics table (S22): walk and ball speed, jump height and air time at each step rate, from the player's position in the trace, one game process per rate with `@rate`. Prints the deviation from the first rate. Tests: `tests/test_phys_table.py`. |
+| `phys_table.py --exe DIR [--rates 60,120,144,240] [--scenarios walk,half,jump,rjump,ball] [--tag t]` | Physics table (S22): walk and ball speed, jump height and air time at each step rate, from the player's position in the trace, one game process per rate with `@rate`. Prints the deviation from the first rate. |
 | `keys_check.py [--exe DIR]` | Presses the keyboard beam and visor keys in the game and prints the beam and visor numbers the game reports; exit 0 when they are the expected ones. |
 
 ## Comparators

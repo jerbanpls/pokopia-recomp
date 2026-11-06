@@ -37,6 +37,7 @@
 #include "nxrt/kernel.h"
 #include "nxrt/svc.h"
 #include "nxrt/config.h"
+#include "nxrt/host_device.h"
 #include "nxrt/jc2_mouse.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/hooks.h"
@@ -305,6 +306,38 @@ void apply_unfocused_mute() {
     audio::set_muted(st.window && st.settings.audio.mute_unfocused && !platform::focused());
 }
 
+// [display] fps_snap = auto|true|false (controls.ini / F1 "Cap FPS to 30 for Steam Deck"; NXRT_DISPLAY_FPS_SNAP overrides it), read on every apply_frame_cap. auto (default) = on for a detected Steam Deck
+// only (host_is_steam_deck: its 90 / 60 Hz panel has no VRR), off on every other machine (a desktop screen may be VRR, and a
+// player's chosen 40 must stay 40). Returns the divisor k (>= 2) the cap snaps to, or 0 with *reason set to why it does not.
+int frame_snap_k(const Settings& s, double cap, float hz, double* snapped, const char** reason) {
+    std::string mode = config_get_str("display", "fps_snap", "");    // the env override, else the player's setting
+    if (mode.empty()) mode = s.display.fps_snap;
+    const bool forced_on = mode == "true" || mode == "on" || mode == "1";
+    const bool forced_off = mode == "false" || mode == "off" || mode == "0";
+    *snapped = cap;
+    if (!s.display.vsync) { *reason = "vsync off"; return 0; }
+    if (forced_off) { *reason = "fps_snap off"; return 0; }
+    if (!forced_on && !host_is_steam_deck()) { *reason = "fps_snap auto, not a Steam Deck"; return 0; }
+    if (cap <= 0) { *reason = "uncapped"; return 0; }
+    if (hz <= 0) { *reason = "refresh rate unknown"; return 0; }
+    if (cap >= hz) { *reason = "cap not below the refresh rate"; return 0; }
+    const FrameSnap sn = snap_frame_cap(cap, hz);
+    if (sn.k < 2) { *reason = "cap within 0.5% of the refresh rate"; return 0; }
+    *snapped = sn.cap;
+    return sn.k;
+}
+
+void log_frame_cap(double req, double snapped, float hz, int k, const char* reason) {
+    static std::mutex mu;
+    static double l_req = -2, l_snapped = -2, l_hz = -2;
+    static int l_k = -2;
+    std::lock_guard<std::mutex> lk(mu);
+    if (req == l_req && snapped == l_snapped && hz == l_hz && k == l_k) return;
+    l_req = req; l_snapped = snapped; l_hz = hz; l_k = k;
+    if (k >= 2) NXLOG_I(kTag, "frame cap %g -> %g (%g Hz panel, every %d refreshes)", req, snapped, static_cast<double>(hz), k);
+    else NXLOG_I(kTag, "frame cap %g (%g Hz, no snap: %s)", req, static_cast<double>(hz), reason);
+}
+
 void apply_frame_cap(const Settings& s) {
     G& st = g();
     double cap = s.display.fps_cap;
@@ -321,7 +354,15 @@ void apply_frame_cap(const Settings& s) {
         // fills (three images) and every picture is shown one to two frames after it was simulated; just under the refresh rate the queue stays empty.
         const float hz = st.window ? platform::display_refresh_hz() : 0.f;
         static const bool vsync_cap = config_get_bool("latency", "vsync_cap", true);
-        if (cap <= 0 || (hz > 0 && cap >= hz)) cap = (vsync_cap && hz > 0) ? static_cast<double>(hz) * 0.9995 : 0;
+        const double req = cap;
+        double snapped = cap;
+        const char* reason = "";
+        const int k = frame_snap_k(s, cap, hz, &snapped, &reason);
+        log_frame_cap(req, snapped, hz, k, reason);
+        if (k >= 2) cap = snapped;      // hz / k: the limiter period is exactly k refresh intervals
+        else if (cap <= 0 || (hz > 0 && cap >= hz)) cap = (vsync_cap && hz > 0) ? static_cast<double>(hz) * 0.9995 : 0;
+    } else {
+        log_frame_cap(cap, cap, 0.f, 0, "vsync off");
     }
     st.limiter.set_target_fps(cap);
     extras::lowlat_note_cap(cap);     // Reflex / Anti-Lag pace to the same cap (remembered for a renderer that is created later)
@@ -1044,6 +1085,12 @@ public:
         if (st.window) {
             s.window_mode = window_mode_name(platform::fullscreen_mode());
             s.refresh_hz = platform::display_refresh_hz();
+            if (st.settings.display.vsync && st.settings.display.fps_cap > 0) {
+                double sc = 0;
+                const char* why = "";
+                s.snap_k = frame_snap_k(st.settings, st.settings.display.fps_cap, s.refresh_hz, &sc, &why);
+                s.snap_cap = sc;
+            }
             platform::pixel_size(&s.width, &s.height);
         }
         s.out = st.engine->output(now_ns());

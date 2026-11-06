@@ -125,5 +125,19 @@ uint64_t language_code_u64(Language l);  // the same string as the little-endian
 // use) and the folder save data lives in ([fs] save_dir, default %APPDATA%\<game save folder>\save, nxrt/game.h).
 std::string romfs_dir();
 std::string save_dir();
+// [fs] romfs_base (default empty: none): a folder (or .nup) layered under [fs] romfs. The files of [fs] romfs win; every file it lacks is
+// served from here, as the console serves a patch over its base game. Set by the launcher for an update dumped without the base game's
+// files under it (fork #128).
+std::string romfs_base_dir();
+
+// The RomFS image the game reads ([fs] romfs over [fs] romfs_base), built on the first call (the game's first OpenDataStorage reuses it).
+struct RomfsSummary {
+    bool ok = false;               // false: the folder cannot be served (error says why)
+    std::string error;
+    uint32_t files = 0, dirs = 0;  // dirs counts the root
+    uint64_t bytes = 0;            // sum of the file sizes
+    uint32_t base_files = 0;       // files that came from [fs] romfs_base
+};
+RomfsSummary romfs_summary();
 
 }  // namespace nxrt::services

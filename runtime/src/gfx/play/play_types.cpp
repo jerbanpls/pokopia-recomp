@@ -182,7 +182,7 @@ bool parse_corner(const std::string& name, Corner* out) {
 
 // ---- actions -----------------------------------------------------------------------------------------------------------------
 
-// One row per Act, in enum order (checked by the static_assert below and by the unit tests). The generic names and outputs: the game's
+// One row per Act, in enum order (checked by the static_assert below). The generic names and outputs: the game's
 // action slots have no factory output here; the registered game gives its own table (GameVocabulary::acts).
 namespace {
 const ActInfo kActs[] = {
@@ -425,6 +425,42 @@ bool parse_input(const std::string& name_in, InputId* out) {
         id.code = static_cast<int32_t>(sc);
     }
     if (out) *out = id;
+    return true;
+}
+
+// ---- quality presets ---------------------------------------------------------------------------------------------------------
+
+namespace {
+const QualityPresetInfo kQualityPresets[] = {
+    {"switch2", "Switch 2 (console)", "The console's picture.", false},
+    {"high", "High", "A sharper, farther picture than the console's.", false},
+    {"ultra", "Ultra", "The sharpest and farthest picture.", false},
+    {"steamdeck", "Steam Deck", "For the Steam Deck's 1280 x 800 screen: a steady frame rate over sharpness.", true},
+    {"legion_go_s", "Legion Go S", "For the Legion Go S's 1920 x 1200 screen: a steady 60 fps.", true},
+    {"laptop", "Laptop", "For laptops with built-in or entry graphics: light on the GPU and the battery.", true},
+    {"desktop", "Desktop PC", "For a desktop with a dedicated graphics card: sharp, far and as fast as the display.", true},
+    {"custom", "Custom", "Your own values.", false},
+};
+}  // namespace
+
+const QualityPresetInfo* quality_presets(int* count) {
+    if (count) *count = static_cast<int>(sizeof kQualityPresets / sizeof kQualityPresets[0]);
+    return kQualityPresets;
+}
+
+const QualityPresetInfo* find_quality_preset(const std::string& id) {
+    const std::string key = name_key(id);
+    for (const QualityPresetInfo& q : kQualityPresets)
+        if (key == q.id) return &q;
+    return nullptr;
+}
+
+bool quality_preset_edited(DisplaySettings& d, QualityField f) {
+    if (d.quality_preset == "custom") return false;
+    const QualityPresetInfo* q = find_quality_preset(d.quality_preset);
+    const bool frame = f == QualityField::RenderScale || f == QualityField::FrameLimit;
+    if (frame && !(q && q->sets_frame)) return false;   // the picture presets leave the render scale and the frame limit alone
+    d.quality_preset = "custom";
     return true;
 }
 

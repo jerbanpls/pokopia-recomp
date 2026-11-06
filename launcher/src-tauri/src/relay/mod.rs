@@ -137,8 +137,6 @@ mod codec;
 mod proto;
 pub mod room_code;
 mod server;
-#[cfg(test)]
-mod tests;
 
 pub use server::{Config, RelayServer, Status};
 

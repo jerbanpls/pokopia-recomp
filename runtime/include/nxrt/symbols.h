@@ -10,7 +10,7 @@
 namespace nxrt {
 
 struct SymbolInfo {
-    std::string module;   // "nxrt_tests.exe" (file name only), or "?" when the address is in no loaded module
+    std::string module;   // "pkp.exe" (file name only), or "?" when the address is in no loaded module
     uint64_t offset = 0;  // address - module base
     std::string symbol;   // nearest preceding public symbol (undecorated when possible), empty when unknown
     uint64_t sym_offset = 0;  // address - symbol start

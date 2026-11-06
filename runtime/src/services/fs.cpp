@@ -48,6 +48,7 @@ struct FsState {
     std::mutex mu;
     std::shared_ptr<fs::RomfsImage> rom;
     bool rom_failed = false;
+    std::string rom_error;                                 // why the RomFS image could not be built
     std::map<std::string, std::weak_ptr<Volume>> saves;   // key -> open volume (one at a time per save)
     std::map<uint64_t, std::string> ids;                  // SaveDataId -> key, for the commands that name a save by id
 };
@@ -429,14 +430,18 @@ std::shared_ptr<fs::RomfsImage> rom_image() {
     auto img = std::make_shared<fs::RomfsImage>();
     std::string err;
     const std::string dir = romfs_dir();
-    if (!img->build(dir, &err)) {
-        NXLOG_E("fs", "RomFS folder '%s' cannot be served: %s (set [fs] romfs)", dir.c_str(), err.c_str());
+    const std::string base = romfs_base_dir();
+    if (!img->build(dir, &err, base)) {
+        NXLOG_E("fs", "RomFS folder '%s'%s%s cannot be served: %s (set [fs] romfs)", dir.c_str(), base.empty() ? "" : " over ", base.c_str(), err.c_str());
         st().rom_failed = true;
+        st().rom_error = err;
         return nullptr;
     }
     const fs::RomfsImage::Stats s = img->stats();
     NXLOG_I("fs", "RomFS image from %s: %u files, %u directories, %llu bytes of data, image size %llu", dir.c_str(), s.files, s.dirs,
             static_cast<unsigned long long>(s.data_bytes), static_cast<unsigned long long>(img->size()));
+    if (!base.empty())
+        NXLOG_I("fs", "RomFS: %u of the %u files come from the base game's RomFS %s ([fs] romfs_base)", s.base_files, s.files, base.c_str());
     st().rom = img;
     return img;
 }
@@ -581,7 +586,8 @@ std::shared_ptr<Service> make_fsp() {
     auto s = std::make_shared<Service>("fsp-srv");
     s->add_cmd(1, "SetCurrentProcess", [](Request&, Response&) -> uint32_t { return 0; });
     s->add_cmd(2, "OpenDataFileSystemByCurrentProcess", [](Request&, Response& rsp) -> uint32_t {
-        if (nup::is_nup(romfs_dir())) return fs::rc::kTargetNotFound;    // a .nup is served as the RomFS image (OpenDataStorage) only
+        // a .nup, and a RomFS layered over the base game's, are served as the RomFS image (OpenDataStorage) only
+        if (nup::is_nup(romfs_dir()) || !romfs_base_dir().empty()) return fs::rc::kTargetNotFound;
         auto v = std::make_shared<Volume>(romfs_dir(), false, true, 0);
         if (!v->ok()) return fs::rc::kTargetNotFound;
         rsp.push_object(make_filesystem(v, "rom:"));
@@ -785,8 +791,26 @@ void fs_reset() {
     std::lock_guard<std::mutex> lk(st().mu);
     st().rom.reset();
     st().rom_failed = false;
+    st().rom_error.clear();
     st().saves.clear();
     st().ids.clear();
+}
+
+RomfsSummary romfs_summary() {
+    RomfsSummary r;
+    const std::shared_ptr<fs::RomfsImage> img = rom_image();
+    if (!img) {
+        std::lock_guard<std::mutex> lk(st().mu);
+        r.error = st().rom_error.empty() ? "the RomFS folder cannot be served" : st().rom_error;
+        return r;
+    }
+    const fs::RomfsImage::Stats s = img->stats();
+    r.ok = true;
+    r.files = s.files;
+    r.dirs = s.dirs;
+    r.bytes = s.data_bytes;
+    r.base_files = s.base_files;
+    return r;
 }
 
 namespace fsapi {

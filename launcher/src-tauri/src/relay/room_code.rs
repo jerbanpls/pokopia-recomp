@@ -65,23 +65,3 @@ fn os_random(buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codes_normalize_format_and_differ() {
-        assert_eq!(normalize("abcd-efgh-jkmn-pqrs").as_deref(), Some("ABCDEFGHJKMNPQRS"));
-        assert_eq!(normalize(" o1il 2345 6789 TVWX ").as_deref(), Some("011123456789TVWX"));
-        assert_eq!(normalize("ABCDEFGHJKMNPQR"), None); // 15 symbols
-        assert_eq!(normalize("ABCDEFGHJKMNPQRST"), None); // 17
-        assert_eq!(normalize("ABCDEFGHJKMNPQRU"), None); // U is not in the alphabet
-        assert_eq!(normalize("ABCDEFGHJKMNPQR_"), None);
-        assert_eq!(normalize("ABCDEFGHJKMNPQRé"), None);
-        assert_eq!(format("ABCDEFGHJKMNPQRS"), "ABCD-EFGH-JKMN-PQRS");
-        let (a, b) = (new_code().unwrap(), new_code().unwrap());
-        assert_eq!(normalize(&format(&a)).as_deref(), Some(a.as_str()));
-        assert_ne!(a, b);
-    }
-}

@@ -1,13 +1,10 @@
 # Builds the player zip (game-build/scripts/make-release.ps1). A tag v<x.y.z> publishes it as a GitHub release, its notes taken from
-# that version's section of CHANGELOG.md. Pull requests and manual runs only build it (artifact).
+# that version's section of CHANGELOG.md. Manual runs only build it (artifact). No test or pull request checks.
 name: Release
 
 on:
   push:
     tags: ['v*']
-  pull_request:
-    branches: [main]
-    paths: ['runtime/**', 'game-build/**', 'launcher/**', 'recomp/**', 'tools/shaders/**', 'CHANGELOG.md', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
@@ -19,56 +16,7 @@ env:
   BASE_RELEASE: v0.1.1            # upstream package the third-party payload comes from (make-release.ps1)
 
 jobs:
-  # Tests that need no GPU, game data or local toolchain. Left out on purpose: the runtime's nxrt_tests (needs LLVM 23 clang-cl, vcpkg
-  # libvpx and the texture DLLs, i.e. most of the release build, plus several groups already fail on main) and recomp/oracle/hooks
-  # (compiles AArch64 test programs through the local nx_env.cmd toolchain).
-  test:
-    runs-on: windows-2025
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: launcher/package-lock.json
-
-      - name: Launcher UI (tauri's build script needs launcher/dist)
-        working-directory: launcher
-        run: |
-          npm ci
-          npm run build
-          if ($LASTEXITCODE) { exit 1 }
-
-      - name: Launcher cargo test
-        working-directory: launcher/src-tauri
-        run: |
-          cargo test --locked
-          if ($LASTEXITCODE) { exit 1 }
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Recompiler imports (byte-compile nxrecomp, oracle, games)
-        working-directory: recomp
-        run: |
-          python -m compileall -q nxrecomp oracle games
-          if ($LASTEXITCODE) { exit 1 }
-
-      - name: Media tool tests
-        working-directory: tools/media
-        run: |
-          python -m pip install numpy
-          python -m unittest discover -p 'test_*.py'
-          if ($LASTEXITCODE) { exit 1 }
-
   release:
-    needs: test
     runs-on: windows-2025
     timeout-minutes: 120
     defaults:

@@ -16,7 +16,8 @@ Output (--out), content-addressed by the first 16 hex of SHA-1 of the bytes: cod
 SASS), ctrl/<h>.bin (control sections), glslc/<h>.bin (whole GLSLC outputs); manifest.tsv (one row per occurrence with
 all three hashes), unique.tsv (one row per distinct code block, with its first occurrence's ctrl/glslc), summary.txt.
 Deterministic: files and entries are visited in sorted order; "first occurrence" is in that order.
-Usage: python -I extract_corpus.py --romfs <romfs> [--main <main.elf>] --out <dir> [--jobs 4]
+Usage: python -I extract_corpus.py --romfs <romfs> [--romfs-base <base romfs>] [--main <main.elf>] --out <dir> [--jobs 4]
+  --romfs-base: the base game's romfs under an update's (the update's files win), for an update dumped without the base game's files
 """
 import argparse, collections, hashlib, mmap, os, struct, sys, zlib
 from concurrent.futures import ProcessPoolExecutor
@@ -191,16 +192,21 @@ def scan_main(path, out):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--romfs', required=True)
+    ap.add_argument('--romfs-base', help="the base game's romfs, layered under --romfs (files of --romfs win)")
     ap.add_argument('--main')
     ap.add_argument('--out', required=True)
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--progress', action='store_true', help='print "scan: <done> <total>" lines while scanning')
     a = ap.parse_args()
-    root = os.path.join(a.romfs, 'motor_asset_re')
-    paths = []
-    for r, _, fs in os.walk(root):
-        paths += [os.path.join(r, f) for f in fs if f.endswith(('.fdata', '.file'))]
-    paths.sort(key=lambda p: os.path.relpath(p, root).replace(os.sep, '/'))
+    by_rel = {}   # path below motor_asset_re -> host path; the update's (--romfs) files win over the base game's
+    for top in [a.romfs] + ([a.romfs_base] if a.romfs_base else []):
+        root = os.path.join(top, 'motor_asset_re')
+        for r, _, fs in os.walk(root):
+            for f in fs:
+                if f.endswith(('.fdata', '.file')):
+                    p = os.path.join(r, f)
+                    by_rel.setdefault(os.path.relpath(p, root).replace(os.sep, '/'), p)
+    paths = [by_rel[k] for k in sorted(by_rel)]
     for sub in ('code', 'ctrl', 'glslc'):
         os.makedirs(os.path.join(a.out, sub), exist_ok=True)
     seen = {}

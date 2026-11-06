@@ -65,4 +65,24 @@ bool host_is_handheld() {
     return handheld;
 }
 
+bool host_is_steam_deck() {
+    static const bool deck = [] {
+        char env[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SteamDeck", env, sizeof env);
+        const std::string product = smbios("SystemProductName", "product_name");
+        const bool d = (n > 0 && n < sizeof env && lower_trimmed(std::string(env, n)) == "1") || product == "jupiter" || product == "galileo";
+        NXLOG_I("host", "steam deck: %s (board '%s')", d ? "yes" : "no", product.c_str());
+        return d;
+    }();
+    return deck;
+}
+
+bool host_is_wine() {
+    static const bool wine = [] {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        return nt && GetProcAddress(nt, "wine_get_version");
+    }();
+    return wine;
+}
+
 }  // namespace nxrt

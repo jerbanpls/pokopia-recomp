@@ -1,27 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Pipeline layouts, shader modules and pipelines (see nvn_pipeline.h). Pipeline creation is synchronous on the render thread; a
-// VkPipelineCache persists between runs ([nvn] pipeline_cache, default "pipeline_cache.bin").
+// Pipeline layouts, shader modules and pipelines (see nvn_pipeline.h). A pipeline the key file's prewarm or the pipeline libraries do not
+// provide is created on the render thread at its first draw while the game loads, and in play ([nvn] async_whole, the loading gate of
+// nvn_gpl.cpp) on a background thread while the draw is skipped. Compute pipelines are built ahead at boot from the key file ([nvn]
+// compute_prewarm) and in the background when the game sets a compute program ([nvn] async_compute); a dispatch whose pipeline is missing in
+// play is skipped only when the CPU cannot read what it writes (do_dispatch, nvn_replay.cpp). A VkPipelineCache persists between runs
+// ([nvn] pipeline_cache, default "pipeline_cache.bin").
 #include "nvn_pipeline.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 #if defined(_MSC_VER) && defined(_M_X64)
 #include <intrin.h>
+#endif
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 #include "nxrt/config.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gauge.h"
+#include "nxrt/host_device.h"
 #include "nxrt/log.h"
 #include "nvn_format_guard.h"
 #include "nvn_gpu_internal.h"
@@ -68,7 +86,18 @@ struct GfxEntry {
     std::shared_ptr<PipeUpgrade> up;
 };
 std::unordered_map<uint64_t, std::vector<GfxEntry>> g_gfx;
-std::map<std::pair<const ShaderInfo*, VkPipelineLayout>, VkPipeline> g_compute;
+// Compute pipelines, by the shader's content (its cache hash, so the key file's stand-in shader and the game's own find the same entry; the
+// pointer for a shader without one) and the shared pipeline layout. Background threads (prewarm, async jobs) insert, the render thread
+// looks up and builds: every access holds g_compute_mu; g_compute_cv is signalled when an entry becomes done.
+struct ComputeEntry {
+    int state = 0;                                   // 0 queued for an async thread, 1 being built, 2 done (pipe null: the build failed)
+    VkPipeline pipe = VK_NULL_HANDLE;
+};
+using ComputeKey = std::pair<uint64_t, VkPipelineLayout>;
+std::mutex g_compute_mu;
+std::condition_variable g_compute_cv;
+std::map<ComputeKey, ComputeEntry> g_compute;      // node based: an entry stays where it is while others are added
+std::atomic<uint64_t> g_cs_skipped{0}, g_cs_at_dispatch{0}, g_cs_prewarmed{0}, g_cs_background{0};
 VkPipelineCache g_cache = VK_NULL_HANDLE;
 bool g_cache_tried = false;
 std::string g_cache_path;
@@ -82,6 +111,94 @@ nxrt::GaugeCounter g_gfx_keys{"nvn.pipeline_keys"};              // entries in g
 nxrt::GaugeCounter g_compute_keys{"nvn.compute_pipeline_keys"};  // entries in g_compute
 nxrt::GaugeCounter g_const_n{"nvn.const_buffers"};               // entries in g_const_bufs
 nxrt::GaugeCounter g_const_bytes{"nvn.const_buffers.bytes"};     // bytes of the constant buffers in g_const_bufs
+
+// ---- async threads: [nvn] async_whole and [nvn] async_compute (nvn_pipeline.h) --------------------------------------------------
+// A graphics job builds the whole pipeline of a draw that is skipped meanwhile. Its `up` is the bucket entry's: the lookup swaps the
+// pipeline in with gpl_take_upgrade once state is 1 (the entry's own pipeline is null until then, so the draw is skipped). A compute job
+// (cs set) builds a compute pipeline into g_compute; with no layout (the game set the program, nothing dispatched yet) the thread derives it.
+// Layouts: ProgLayout objects live in g_layouts (a std::map, node based) until pipeline_shutdown, which stops these threads (aw_stop) before
+// it clears g_layouts, so a job's layout pointer outlives the job.
+struct AsyncJob {
+    GraphicsKey key;
+    const ProgLayout* layout = nullptr;
+    std::shared_ptr<PipeUpgrade> up;
+    const ShaderInfo* cs = nullptr;                  // a compute job
+};
+std::mutex g_aw_mu;
+std::condition_variable g_aw_cv;
+std::deque<AsyncJob> g_aw_q;
+std::vector<std::thread> g_aw_threads;
+bool g_aw_stop = false;                              // stays set after pipeline_shutdown: later requests build at the draw / dispatch
+std::atomic<uint64_t> g_aw_built{0}, g_aw_failed{0}, g_aw_skipped{0};
+
+bool compute_build_bg(const ShaderInfo* cs, const ProgLayout& layout, bool prewarm);   // below, with compute_pipeline
+
+void aw_main() {
+    log_set_thread_name("nvn-async-pipe");
+    set_compile_thread_priority();
+    for (;;) {
+        AsyncJob j;
+        {
+            std::unique_lock<std::mutex> lk(g_aw_mu);
+            g_aw_cv.wait(lk, [] { return g_aw_stop || !g_aw_q.empty(); });
+            if (g_aw_stop) return;
+            j = std::move(g_aw_q.front());
+            g_aw_q.pop_front();
+        }
+        if (j.cs) {
+            const ShaderInfo* st6[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, j.cs};
+            const ProgLayout* pl = j.layout ? j.layout : prog_layout(st6);
+            if (pl) compute_build_bg(j.cs, *pl, false);
+            continue;
+        }
+        VkPipeline p = VK_NULL_HANDLE;
+        {
+            NXFT("pipe.async_whole");
+            p = build_graphics_pipeline(j.key, *j.layout);
+        }
+        (p ? g_aw_built : g_aw_failed).fetch_add(1, std::memory_order_relaxed);
+        j.up->pipe = p;
+        j.up->state.store(1, std::memory_order_release);
+    }
+}
+
+// Any thread. False once the threads were stopped (the caller builds it itself). front = ahead of everything queued.
+bool aw_push(AsyncJob&& j, bool front) {
+    std::lock_guard<std::mutex> lk(g_aw_mu);
+    if (g_aw_stop) return false;
+    if (g_aw_threads.empty()) {
+        const int n = static_cast<int>(std::clamp<int64_t>(nxrt::config_get_int("nvn", "async_whole_threads", 1), 1, 4));
+        for (int i = 0; i < n; ++i) g_aw_threads.emplace_back(aw_main);
+        NXLOG_I(kTag, "async pipelines: %d background thread%s for pipelines that would be built at a draw or a dispatch", n, n == 1 ? "" : "s");
+    }
+    if (front) g_aw_q.push_front(std::move(j));
+    else g_aw_q.push_back(std::move(j));
+    g_aw_cv.notify_one();
+    return true;
+}
+
+// Render thread. The entry's upgrade, built on the async threads (null: the threads were stopped).
+std::shared_ptr<PipeUpgrade> aw_queue(const GraphicsKey& key, const ProgLayout& layout) {
+    AsyncJob j;
+    j.key = key;
+    j.layout = &layout;
+    j.up = std::make_shared<PipeUpgrade>();
+    auto up = j.up;
+    return aw_push(std::move(j), false) ? up : nullptr;
+}
+
+// Before the device is torn down: after prewarm_shutdown, before gpl_stop (pipeline_shutdown). A running build finishes first (join).
+void aw_stop() {
+    std::vector<std::thread> t;
+    {
+        std::lock_guard<std::mutex> lk(g_aw_mu);
+        g_aw_stop = true;
+        g_aw_q.clear();               // graphics entries keep state 0 (nothing to destroy); compute entries left at 0 are built at the dispatch
+        t.swap(g_aw_threads);
+    }
+    g_aw_cv.notify_all();
+    for (auto& th : t) th.join();
+}
 
 VkShaderStageFlagBits stage_bit(ShaderStage s) {
     switch (s) {
@@ -723,6 +840,7 @@ static VkPipeline take_entry(GfxEntry& e) {
     counters().pipeline_cache_hits.fetch_add(1, std::memory_order_relaxed);
     if (e.up && e.up->state.load(std::memory_order_acquire) != 0) gpl_take_upgrade(e.second, e.alt, e.up);
     if (e.alt && gpl_ab_whole()) return e.alt;
+    if (!e.second && e.up) g_aw_skipped.fetch_add(1, std::memory_order_relaxed);   // still being built in the background: skipped
     return e.second;
 }
 
@@ -742,8 +860,11 @@ VkPipeline graphics_pipeline(const GraphicsKey& key, const ProgLayout& layout) {
     prewarm_init();
     VkPipeline pipe = VK_NULL_HANDLE;
     std::shared_ptr<PipeUpgrade> later;          // the key file's whole pipeline, still being built: it replaces the linked one
-    // compiled ahead on a worker; one being compiled is linked from its parts meanwhile when they are built (else waited for)
-    if (prewarm_take(key, &pipe, [&] { return gpl_ready(key, layout); }, &later)) {
+    // [nvn] async_whole in play (the loading gate, gpl_gate_open): nothing is built whole or waited for here (stream-out draws excepted)
+    const bool no_stall = async_whole_on() && !key.xfb && gpl_gate_open();
+    // compiled ahead on a worker; one being compiled is linked from its parts meanwhile when they are built (else waited for, or with
+    // no_stall left to the worker while the draw is skipped)
+    if (prewarm_take(key, &pipe, [&] { return gpl_ready(key, layout); }, &later, no_stall)) {
         ++g_pipeline_count;
         g_gfx_keys.add(1);
         bucket.push_back({key, pipe, VK_NULL_HANDLE, nullptr});
@@ -765,6 +886,15 @@ VkPipeline graphics_pipeline(const GraphicsKey& key, const ProgLayout& layout) {
         bucket.push_back({key, VK_NULL_HANDLE, VK_NULL_HANDLE, up});
         return VK_NULL_HANDLE;
     }
+    if (no_stall) {                              // [nvn] async_whole: the key file's build, or one of our own, replaces the empty entry
+        if (!up) up = aw_queue(key, layout);
+        if (up) {
+            ++g_pipeline_count;                  // counted now: the swap in gpl_take_upgrade replaces, it does not add
+            bucket.push_back({key, VK_NULL_HANDLE, VK_NULL_HANDLE, up});
+            g_aw_skipped.fetch_add(1, std::memory_order_relaxed);
+            return VK_NULL_HANDLE;
+        }
+    }
     NXFT("pipe.create");
     pipe = build_graphics_pipeline(key, layout);
     if (pipe) {
@@ -775,37 +905,186 @@ VkPipeline graphics_pipeline(const GraphicsKey& key, const ProgLayout& layout) {
     return pipe;
 }
 
-VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout) {
-    ensure_cache();
-    const auto k = std::make_pair(cs, layout.layout);
-    auto it = g_compute.find(k);
-    if (it != g_compute.end()) return it->second;
-    VkShaderModule m = shader_module(cs);
-    VkPipeline pipe = VK_NULL_HANDLE;
-    if (m) {
-        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = m;
-        ci.stage.pName = "main";
-        ci.layout = layout.layout;
-        const uint64_t tp0 = nxrt::hitch_ticks();
-        const VkResult cr = vkCreateComputePipelines(vkdev(), g_cache, 1, &ci, nullptr, &pipe);
-        if (nxrt::hitch_on_render_thread()) nxrt::hitch_phase_add(nxrt::kHpRenderPipeline, nxrt::hitch_ticks() - tp0);
-        if (cr != VK_SUCCESS) {
-            NXLOG_E(kTag, "compute pipeline failed for %s", cs->hash.c_str());
-            pipe = VK_NULL_HANDLE;
-        } else {
-            counters().pipelines_created.fetch_add(1);
-            ++g_pipeline_count;
-            g_pipes_created.add(1);
-            g_cache_dirty.store(true, std::memory_order_relaxed);
-    g_new_since_save.fetch_add(1, std::memory_order_relaxed);
-        }
+// ---- compute pipelines ----------------------------------------------------------------------------------------------------------
+namespace {
+uint64_t compute_code_id(const ShaderInfo* cs) {
+    uint64_t v = 0;
+    for (char ch : cs->hash) {
+        uint64_t d;
+        if (ch >= '0' && ch <= '9') d = static_cast<uint64_t>(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') d = static_cast<uint64_t>(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') d = static_cast<uint64_t>(ch - 'A' + 10);
+        else { v = 0; break; }
+        v = (v << 4) | d;
     }
-    g_compute[k] = pipe;                         // new key: the lookup above missed
-    g_compute_keys.add(1);
+    return v ? v : reinterpret_cast<uint64_t>(cs);
+}
+
+// Any thread, no lock held. Counters as before; the hitch phase only on the render thread.
+VkPipeline create_compute(const ShaderInfo* cs, const ProgLayout& layout) {
+    ensure_cache();
+    VkShaderModule m = shader_module(cs);
+    if (!m) return VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = m;
+    ci.stage.pName = "main";
+    ci.layout = layout.layout;
+    const uint64_t tp0 = nxrt::hitch_ticks();
+    const VkResult cr = vkCreateComputePipelines(vkdev(), g_cache, 1, &ci, nullptr, &pipe);
+    if (nxrt::hitch_on_render_thread()) nxrt::hitch_phase_add(nxrt::kHpRenderPipeline, nxrt::hitch_ticks() - tp0);
+    if (cr != VK_SUCCESS) {
+        NXLOG_E(kTag, "compute pipeline failed for %s", cs->hash.c_str());
+        return VK_NULL_HANDLE;
+    }
+    counters().pipelines_created.fetch_add(1);
+    ++g_pipeline_count;
+    g_pipes_created.add(1);
+    g_cache_dirty.store(true, std::memory_order_relaxed);
+    g_new_since_save.fetch_add(1, std::memory_order_relaxed);
     return pipe;
+}
+
+// The entry of (cs, layout), made (state 0) when absent. g_compute_mu held.
+ComputeEntry& compute_entry_locked(const ShaderInfo* cs, const ProgLayout& layout) {
+    auto [it, fresh] = g_compute.try_emplace(ComputeKey{compute_code_id(cs), layout.layout});
+    if (fresh) g_compute_keys.add(1);
+    return it->second;
+}
+
+// A background build (async thread or prewarm worker): only when nobody built it or is building it. True: this call built it.
+bool compute_build_bg(const ShaderInfo* cs, const ProgLayout& layout, bool prewarm) {
+    ComputeEntry* e;
+    {
+        std::lock_guard<std::mutex> lk(g_compute_mu);
+        e = &compute_entry_locked(cs, layout);
+        if (e->state != 0) return false;
+        e->state = 1;
+    }
+    VkPipeline p;
+    {
+        NXFT("cs.build");
+        p = create_compute(cs, layout);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_compute_mu);
+        e->pipe = p;
+        e->state = 2;
+    }
+    g_compute_cv.notify_all();
+    (prewarm ? g_cs_prewarmed : g_cs_background).fetch_add(1, std::memory_order_relaxed);
+    if (p && !prewarm) prewarm_record_compute(cs, compute_layout_key(layout));     // the key file's record: built at boot next time
+    return true;
+}
+}  // namespace
+
+uint64_t compute_layout_key(const ProgLayout& layout) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull; };
+    for (const BindingDesc& d : layout.bindings) {
+        mix(d.set);
+        mix(d.binding);
+        mix(static_cast<uint64_t>(d.type));
+        mix(d.stages);
+    }
+    mix(layout.push_stages);
+    mix(layout.push_bytes);
+    return h;
+}
+
+// Render thread: the pipeline, built here when nobody has it. One a background thread is building is waited for (`cs.wait`; the old path
+// built it here, which takes at least as long); one still queued is taken over.
+VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout) {
+    std::unique_lock<std::mutex> lk(g_compute_mu);
+    ComputeEntry& e = compute_entry_locked(cs, layout);
+    if (e.state == 2) return e.pipe;
+    if (e.state == 1) {
+        NXFT("cs.wait");
+        g_compute_cv.wait(lk, [&] { return e.state == 2; });
+        return e.pipe;
+    }
+    e.state = 1;
+    lk.unlock();
+    const auto t0 = std::chrono::steady_clock::now();
+    VkPipeline p = create_compute(cs, layout);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    lk.lock();
+    e.pipe = p;
+    e.state = 2;
+    lk.unlock();
+    g_compute_cv.notify_all();
+    g_cs_at_dispatch.fetch_add(1, std::memory_order_relaxed);
+    NXLOG_I(kTag, "compute built at the dispatch %s (%.1f ms%s)", cs->hash.c_str(), ms, gpl_gate_open() ? "" : ", loading");
+    if (p) prewarm_record_compute(cs, compute_layout_key(layout));
+    return p;
+}
+
+bool compute_pipeline_done(const ShaderInfo* cs, const ProgLayout& layout) {
+    std::lock_guard<std::mutex> lk(g_compute_mu);
+    auto it = g_compute.find(ComputeKey{compute_code_id(cs), layout.layout});
+    return it != g_compute.end() && it->second.state == 2;
+}
+
+bool compute_queue_front(const ShaderInfo* cs, const ProgLayout& layout) {
+    {
+        std::lock_guard<std::mutex> lk(g_compute_mu);
+        auto [it, fresh] = g_compute.try_emplace(ComputeKey{compute_code_id(cs), layout.layout});
+        if (!fresh) return true;                  // queued by an earlier dispatch, being built, or done meanwhile
+        g_compute_keys.add(1);
+    }
+    AsyncJob j;
+    j.cs = cs;
+    j.layout = &layout;
+    return aw_push(std::move(j), true);
+}
+
+void compute_program_set(const ShaderInfo* cs) {
+    if (!cs || !async_compute_on()) return;
+    static std::mutex mu;
+    static std::unordered_map<const ShaderInfo*, bool> seen;           // queued once per shader
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!seen.emplace(cs, true).second) return;
+    }
+    AsyncJob j;
+    j.cs = cs;                                    // layout derived on the async thread (prog_layout takes its own lock)
+    aw_push(std::move(j), false);
+}
+
+bool compute_build_ahead(const ShaderInfo* cs, uint64_t layout_key) {
+    const ShaderInfo* st6[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, cs};
+    const ProgLayout* pl = cs ? prog_layout(st6) : nullptr;
+    if (!pl || compute_layout_key(*pl) != layout_key) return false;    // the shader's descriptors changed since it was recorded
+    compute_build_bg(cs, *pl, true);
+    return true;
+}
+
+ComputeStats compute_stats() {
+    ComputeStats s;
+    s.skipped = g_cs_skipped.load(std::memory_order_relaxed);
+    s.at_dispatch = g_cs_at_dispatch.load(std::memory_order_relaxed);
+    s.prewarmed = g_cs_prewarmed.load(std::memory_order_relaxed);
+    s.background = g_cs_background.load(std::memory_order_relaxed);
+    return s;
+}
+
+void compute_note_skipped() { g_cs_skipped.fetch_add(1, std::memory_order_relaxed); }
+
+bool async_compute_on() {
+    static const bool on = [] {
+        const bool v = nxrt::config_get_bool("nvn", "async_compute", true);
+        NXLOG_I(kTag, "async_compute %s", v ? "on: compute pipelines are built in the background when a program is set, a dispatch that "
+                                              "only GPU memory sees is skipped while its pipeline builds" : "off");
+        return v;
+    }();
+    return on;
+}
+
+bool compute_prewarm_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "compute_prewarm", true);
+    return on;
 }
 
 VkBuffer constant_data_buffer(const ShaderInfo* s, VkDeviceSize* range) {
@@ -868,10 +1147,27 @@ uint64_t module_content_id(VkShaderModule m) {
 }
 
 uint64_t pipelines_built_at_draw() { return g_built_at_draw.load(std::memory_order_relaxed); }
+uint64_t pipelines_built_async() { return g_aw_built.load(std::memory_order_relaxed); }
+uint64_t draws_skipped_async() { return g_aw_skipped.load(std::memory_order_relaxed); }
+
+bool async_whole_on() {
+    static const bool on = [] {
+        // On every platform (first-run pop-in instead of hitches on Windows too, #120); `auto` (the old default) means the same.
+        const std::string v = nxrt::config_get_str("nvn", "async_whole", "true");
+        bool r = v == "auto" || v == "on" || v == "1" || v == "true";
+        // [nvn] gpl_ab keeps a finished build as the measured alternative instead of swapping it in: an empty entry would stay empty
+        const bool ab = r && nxrt::config_get_int("nvn", "gpl_ab", 0) > 0;
+        if (ab) r = false;
+        NXLOG_I(kTag, "async_whole %s (%s%s, %s)", r ? "on" : "off", v.c_str(), ab ? ", off with gpl_ab" : "", nxrt::host_is_wine() ? "Wine" : "not Wine");
+        return r;
+    }();
+    return on;
+}
 
 void pipeline_shutdown() {
     VkDevice d = vkdev();
     prewarm_shutdown();
+    aw_stop();
     gpl_stop();
     if (!g_cache_big || g_new_since_save.load() >= 300) save_cache();
     for (auto& [h, bucket] : g_gfx)
@@ -884,9 +1180,12 @@ void pipeline_shutdown() {
     ++g_gfx_gen;
     g_gfx_keys.sub(g_gfx_keys.get());
     gpl_shutdown();                              // the parts the pipelines were linked from
-    for (auto& [k, p] : g_compute)
-        if (p) vkDestroyPipeline(d, p, nullptr);
-    g_compute.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_compute_mu);   // the async and prewarm threads are stopped: nothing else holds an entry
+        for (auto& [k, e] : g_compute)
+            if (e.pipe) vkDestroyPipeline(d, e.pipe, nullptr);
+        g_compute.clear();
+    }
     g_compute_keys.sub(g_compute_keys.get());
     g_layouts.clear();
     for (auto& [k, l] : g_shared_layouts) {          // the handles in g_layouts were copies of these

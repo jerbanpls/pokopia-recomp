@@ -1,7 +1,6 @@
 # Python 3.13 in tools\.venv (from the repository root):
 # uv venv tools\.venv --python 3.13
 # uv pip install --python tools\.venv -r recomp\requirements.txt
-unicorn==2.1.4      # reference CPU for the differential and end-to-end oracles
-capstone==5.0.9     # instruction decode for the tier-2 lifter and for corpus shape names
+capstone==5.0.9     # instruction decode for the tier-2 lifter and jump tables
 lz4                 # NSO segment decompression (nxrecomp/nso.py)
-pyelftools          # ELF reading for test programs
+pyelftools          # ELF reading (tools/analysis, tools/boot, tools/survey)

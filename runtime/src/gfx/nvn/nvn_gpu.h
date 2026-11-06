@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The boundary between the NVN entry points (host side, api_*.cpp) and the GPU back end (render thread, nvn_gpu*.cpp,
-// nvn_replay.cpp). The api files only use the functions below; they never include Vulkan. nvn_gpu_stub.cpp implements the same
-// functions without a GPU (a serial counter and nothing else) so the api files can be unit-tested on their own.
+// nvn_replay.cpp). The api files only use the functions below; they never include Vulkan.
 #pragma once
 #include <cstdint>
 #include <vector>
@@ -27,7 +26,10 @@ void finish();
 uint64_t last_serial();
 // Waits for `serial` to complete (timeout_ns: 0 poll, UINT64_MAX forever). True when it did.
 bool wait_serial(uint64_t serial, uint64_t timeout_ns);
-bool serial_done(uint64_t serial);
+// What asks: Sync = a guest poll (nvnSyncWait with timeout 0), which [nvn] poll_flush may leave in the batch; Wait = the caller goes on to block on the
+// serial (or needs it at once), so the batch is flushed immediately.
+enum class PollKind { Wait, Sync };
+bool serial_done(uint64_t serial, PollKind kind = PollKind::Wait);
 
 // Window: texture `index` of the window is shown (after the submissions already made). The call returns when the frame has
 // been handed to the swapchain; it honours the shell's frame limiter.
@@ -57,8 +59,11 @@ void texture_registered(Texture* t);   // the registration half of the above: on
 
 // The GPU image of a texture is copied back into the texture's storage in the game's memory in its block-linear layout (for
 // nvnTextureReadTexels / CopyTextureToBuffer users that read render targets on the CPU). Waits for the GPU. False when the
-// texture has no GPU image yet or cannot be read back.
-bool download_texture(Texture* t);
+// texture has no GPU image yet or cannot be read back. [nvn] readback_async (default true): only the levels and layers asked for
+// (counts clamped to the texture; the defaults ask for all), the render thread records the copy and does not wait for it, and a
+// level the GPU did not write since its last readback is not copied again. false: every level, with the GPU drained first (as before).
+bool download_texture(Texture* t, uint32_t level_first = 0, uint32_t level_count = UINT32_MAX, uint32_t layer_first = 0,
+                      uint32_t layer_count = UINT32_MAX);
 
 // nvnMemoryPoolInvalidateMappedRange / nvnBufferInvalidateMappedRange: the CPU is about to read [addr, +size), which the GPU may have
 // written. Compute results the back end holds in video memory there are copied back first (waits for the GPU). Any thread.

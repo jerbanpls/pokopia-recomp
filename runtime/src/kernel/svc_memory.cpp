@@ -7,6 +7,7 @@
 #include <bit>
 
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -16,6 +17,7 @@
 #include "nxrt/game.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/abi.h"
+#include "nxrt/config.h"
 #include "nxrt/gauge.h"
 #include "nxrt/kernel.h"
 #include "nxrt/log.h"
@@ -168,8 +170,28 @@ void alias_free(uint64_t addr) {
 
 // Logs the refused call with its argument values and sets the result code.
 void fail(::Ctx* c, const char* what, uint32_t rc, uint64_t a, uint64_t b, uint64_t d) {
-    NXLOG_W(kTag, "%s returned 0x%X (args %llx, %llx, %llx)", what, rc, U(a), U(b), U(d));
+    NXLOG_W(kTag, "%s returned 0x%X (args 0x%llx, 0x%llx, 0x%llx)", what, rc, U(a), U(b), U(d));
     svc_ret(c, rc);
+}
+
+// Windows refused the heap commit for lack of commit (ERROR_COMMITMENT_LIMIT: RAM plus page file used up; most often the page file is
+// off or small). The heap is committed whole when the game sizes it (Pokopia: 10.4 GiB at start-up), so this happens at boot, and the
+// game would only crash on the first heap write (code 4). Say why in a box (not in a headless run or a test) and end with code 6.
+[[noreturn]] void out_of_commit(uint64_t want) {
+    char msg[768];
+    std::snprintf(msg, sizeof msg,
+                  "%s could not reserve %.1f GB of memory for the game: Windows' memory limit (RAM plus page file) is used up.\n\n"
+                  "Turn on the page file: Settings > System > About > Advanced system settings > Performance Settings > Advanced > "
+                  "Virtual memory > Change, tick \"Automatically manage paging file size for all drives\", then restart Windows. "
+                  "Closing other programs can also help.",
+                  game::info().title, static_cast<double>(want) / (1024.0 * 1024.0 * 1024.0));
+    NXLOG_E(kTag, "%s", msg);
+    log_flush();
+    const bool quiet = config_get_str("boot", "gfx", "") == "headless" || config_get_bool("gfx", "headless", false) ||
+                       config_get_bool("gfx", "hidden", false);
+    if (!quiet) MessageBoxA(nullptr, msg, game::info().title, MB_OK | MB_ICONERROR);
+    TerminateProcess(GetCurrentProcess(), 6);
+    for (;;) Sleep(1000);
 }
 
 // ---- SetHeapSize (0x01) ------------------------------------------------------------------------------------------------------
@@ -203,6 +225,7 @@ void set_heap_size(::Ctx* c) {
     }
     const uint64_t old = g_heap_cur;
     if (size > old && !mem::heap_commit(old, size - old)) {
+        if (mem::heap_commit_error() == ERROR_COMMITMENT_LIMIT) out_of_commit(size - old);
         fail(c, "SetHeapSize (commit)", kernel::kOutOfMemory, size, old, 0);
         return;
     }

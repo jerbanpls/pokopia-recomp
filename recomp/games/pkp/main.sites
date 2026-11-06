@@ -116,6 +116,10 @@ midhook 0x7100bfc4fc
 midhook 0x710089e27c
 #   frame rate: its fixed-step frame time (1 / s0, s0 = 60.0), before the division
 midhook 0x710089e398
+#   frame rate: the area-transition scene sequence adds the frame multiplier to its timer, then skips its event while
+#   timer != target. With fractional multipliers above 60 fps it can step past the target and leave the iris wipe closed
+#   forever (#144). Skip only while timer < target instead, so equality or a crossing fires the event; no frame-rate cap.
+patch 0x71004459bc 0x54000121 0x54000123
 #   mouse camera: the follow camera's update (0x7100087840), right after it loaded the right stick's X (s0), x19 = the camera
 midhook 0x7100087d30
 #   mouse camera: the same update past its scene-state check, before the turn gate (every frame the follow camera runs), x19 = the camera
@@ -134,9 +138,11 @@ midhook 0x71017b5254
 #   render resolution: the pass-state viewport recorder 0x71017c0420 (x0 = ctx + 0x10, w1 count, x2 rects; no screen constants of its own:
 #   0x71017b3000 and friends derive 2/w, -2/h from what it records): rects sized for 1920x1080 on render-size targets become the target size
 entryhook 0x71017c0420
-#   render resolution: the terrain occlusion pass (0x710073d73c) calling its 80x45 G-buffer copy 0x71010f48d8: x3 the source colour texture,
-#   x5 the source rect {x, y, w, h}, taken from a viewport recorded as 1920x1080 (becomes the source's size on render-size targets)
-midhook 0x710073d824
+#   render resolution (#44): the KTGL 2D render-target create 0x7101796810 (x0 device, w1 width, w2 height, w4 format; x30 the caller).
+#   Call sites that pass a literal 1920x1080 (or a fraction of it) for a screen-relative target, among them the local-light buffer whose
+#   light volumes texelFetch the render-size G-buffer at gl_FragCoord, get the render size from a per-call-site table (pkp_play.cpp).
+#   (The terrain occlusion copy's mid hook 0x710073d824 is gone: the viewport recorder hook above already gives it the right source rect.)
+entryhook 0x7101796810
 #   render resolution: graphics memory for targets above 1920x1080 (pkp_gfx_heap.cpp): 0x710112ec80 calling the graphics init 0x7101793db0
 #   (x1 = sp+8, the pool config: general pool u64 at sp+0x40, render-target pool at sp+0xa0), and the memory-config callback 0x710112fae4
 #   branching on (x3 = the struct, the graphics arena size u64 at +0x48)
@@ -191,3 +197,6 @@ midhook 0x7101f78030
 midhook 0x7101f78124
 midhook 0x7101f7aa2c
 midhook 0x7101f7fe48
+#   Link Play "Interact everywhere" (pkp_linkplay.cpp, [pkp] link_interact_everywhere): the permission-mask builder 0x71000b0f60, story-area
+#   online block at `movk x13, #1, lsl #32` (x13 = the pattern's bits 0-31, x22 = the session's Spectator flag)
+midhook 0x71000b1030

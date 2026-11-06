@@ -111,6 +111,15 @@ std::string Module::describe(uint64_t addr) const {
     return buf;
 }
 
+void Module::set_build_id(const uint8_t (&id)[32]) {
+    static const char kHex[] = "0123456789abcdef";
+    build_id_.resize(64);
+    for (int i = 0; i < 32; i++) {
+        build_id_[2 * i] = kHex[id[i] >> 4];
+        build_id_[2 * i + 1] = kHex[id[i] & 15];
+    }
+}
+
 // ---- phase 1: map and parse --------------------------------------------------------------------------------------------
 
 Module* LoaderAccess::create_and_map(const uint8_t* d, size_t n, const LoadOptions& opt, std::string* err) {

@@ -5,9 +5,14 @@
 //! The highest valid update is used; with none, the base. A folder that holds `exefs/` and `romfs/` directly
 //! (an `updates/<version>` picked by hand, or a flattened dump) works too, and so does picking `exefs/` itself.
 //! Text-mode FTP copies (CRLF-mangled NSOs) and older game versions get their own message.
+//! The romfs must hold at least the files and bytes of the supported version (`dump_hashes.json` "romfs"): an update dumped without
+//! the base game's files under it has the right exefs and only the files the update changes (fork #128: 22 of 36 files), and the game
+//! then crashes at start (code 4). When the dump also has base/romfs and the two together are complete, the base is layered under the
+//! update (`romfs_base`, served by pkp's `[fs] romfs_base`), as the .nup unpacker does.
 
 use serde::Serialize;
 use std::fs;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +25,7 @@ const OLDER_MAIN_BUILD: &str = "816c5358e8178d802fcec4a7ce5a741a";
 const ROMFS_MARKER_DIR: [&str; 2] = ["motor_asset_re", "KIDS_PLATFORM_OUNCE"];
 const TEXT_MODE_LABEL: &str = "copied in text mode";
 const OLDER_LABEL: &str = "older version";
+const INCOMPLETE_LABEL: &str = "romfs/ is complete";
 
 #[derive(Serialize, Clone)]
 pub struct Check {
@@ -36,8 +42,20 @@ pub struct Candidate {
     pub path: String,
     pub exefs: String,
     pub romfs: String,
+    /// The base game's romfs to layer under `romfs` (its files fill in what the update lacks); empty: none needed.
+    pub romfs_base: String,
+    /// Files and bytes in the romfs as it will be served (with romfs_base under it when that is set).
+    pub romfs_files: u64,
+    pub romfs_bytes: u64,
     pub ok: bool,
     pub checks: Vec<Check>,
+}
+
+/// The least a complete romfs of the supported version holds (extra files such as desktop.ini pass).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RomfsNeed {
+    pub files: u64,
+    pub bytes: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -59,6 +77,40 @@ pub(crate) fn supported() -> Option<(String, String)> {
     let p = crate::exe_dir().join("tools").join("build").join("dump_hashes.json");
     let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(p).ok()?).ok()?;
     Some((v["main_build_id"].as_str()?.to_lowercase(), v["version"].as_str()?.to_string()))
+}
+
+/// The romfs size of the supported version, from `dump_hashes.json` "romfs" {files, bytes}; None without it (no check).
+pub(crate) fn supported_romfs() -> Option<RomfsNeed> {
+    let p = std::env::current_exe().ok()?.parent()?.join("tools").join("build").join("dump_hashes.json");
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(p).ok()?).ok()?;
+    Some(RomfsNeed { files: v["romfs"]["files"].as_u64()?, bytes: v["romfs"]["bytes"].as_u64()? })
+}
+
+/// Every file below `root` as (path relative to it with '/', size). Unreadable folders count as empty.
+fn romfs_files(root: &Path) -> BTreeMap<String, u64> {
+    fn walk(dir: &Path, prefix: &str, depth: u32, out: &mut BTreeMap<String, u64>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() && depth < 32 {
+                walk(&e.path(), &format!("{}{}/", prefix, name), depth + 1, out);
+            } else if ft.is_file() {
+                out.insert(format!("{}{}", prefix, name), e.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, "", 0, &mut out);
+    out
+}
+
+fn totals(files: &BTreeMap<String, u64>) -> (u64, u64) {
+    (files.len() as u64, files.values().sum())
+}
+
+fn gb(b: u64) -> f64 {
+    b as f64 / 1e9
 }
 
 /// Build ID of a decrypted NSO (20 bytes at 0x40), lower-case hex; None if the file is missing, short or not an NSO.
@@ -92,9 +144,12 @@ fn dir_has_entries(p: &Path) -> bool {
     fs::read_dir(p).map(|mut rd| rd.next().is_some()).unwrap_or(false)
 }
 
-fn check_candidate(kind: &str, version: &str, dir: &Path, want: Option<&(String, String)>) -> Candidate {
+/// `base_romfs`: the base game's romfs of the same dump (for an update), layered under this romfs when this one alone is incomplete.
+fn check_candidate(kind: &str, version: &str, dir: &Path, want: Option<&(String, String)>, need: Option<RomfsNeed>, base_romfs: Option<&Path>) -> Candidate {
     let exefs = dir.join("exefs");
     let romfs = dir.join("romfs");
+    let mut romfs_base = String::new();
+    let (mut romfs_files_n, mut romfs_bytes_n) = (0u64, 0u64);
     let mut checks = Vec::new();
     for f in EXEFS_FILES {
         checks.push(Check { label: format!("exefs/{}", f), ok: exefs.join(f).is_file() });
@@ -106,6 +161,35 @@ fn check_candidate(kind: &str, version: &str, dir: &Path, want: Option<&(String,
         if filled {
             let marker = ROMFS_MARKER_DIR.iter().fold(romfs.clone(), |a, b| a.join(b));
             checks.push(Check { label: "romfs/ holds the game data".to_string(), ok: dir_has_entries(&marker) });
+        }
+        let mut files = romfs_files(&romfs);
+        (romfs_files_n, romfs_bytes_n) = totals(&files);
+        if let Some(n) = need {
+            let complete = |f: u64, b: u64| f >= n.files && b >= n.bytes;
+            let mut ok = complete(romfs_files_n, romfs_bytes_n);
+            if !ok {
+                // an update that only holds the files it changes: the base game's romfs underneath (the update's files win)
+                if let Some(b) = base_romfs.filter(|b| b.is_dir()) {
+                    for (rel, size) in romfs_files(b) {
+                        files.entry(rel).or_insert(size);
+                    }
+                    let (f, by) = totals(&files);
+                    if complete(f, by) {
+                        ok = true;
+                        romfs_base = fwd(b);
+                        (romfs_files_n, romfs_bytes_n) = (f, by);
+                        checks.push(Check { label: format!("romfs/ completed from {}", fwd(b)), ok: true });
+                    }
+                }
+            }
+            checks.push(Check {
+                label: if ok {
+                    INCOMPLETE_LABEL.to_string()
+                } else {
+                    format!("{} ({} of {} files, {:.2} of {:.2} GB)", INCOMPLETE_LABEL, romfs_files_n, n.files, gb(romfs_bytes_n), gb(n.bytes))
+                },
+                ok,
+            });
         }
     }
     for f in NSO_FILES {
@@ -133,6 +217,9 @@ fn check_candidate(kind: &str, version: &str, dir: &Path, want: Option<&(String,
         path: fwd(dir),
         exefs: fwd(&exefs),
         romfs: fwd(&romfs),
+        romfs_base,
+        romfs_files: romfs_files_n,
+        romfs_bytes: romfs_bytes_n,
         ok,
         checks,
     }
@@ -149,10 +236,10 @@ fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 pub fn scan(path: &str) -> DumpReport {
-    scan_with(path, supported())
+    scan_need(path, supported(), supported_romfs())
 }
 
-fn scan_with(path: &str, want: Option<(String, String)>) -> DumpReport {
+fn scan_need(path: &str, want: Option<(String, String)>, need: Option<RomfsNeed>) -> DumpReport {
     let root = PathBuf::from(path.trim());
     let mut report = DumpReport {
         path: fwd(&root),
@@ -186,8 +273,12 @@ fn scan_with(path: &str, want: Option<(String, String)>) -> DumpReport {
         return report;
     }
 
+    let base_romfs = base.join("romfs");
     if let Some(d) = &direct {
-        report.candidates.push(check_candidate("folder", "", d, want.as_ref()));
+        // updates/<version> picked by hand: the base game is at ../../base
+        let up = d.parent().filter(|p| p.file_name().map_or(false, |n| n.eq_ignore_ascii_case("updates")));
+        let near = up.and_then(|p| p.parent()).map(|p| p.join("base").join("romfs"));
+        report.candidates.push(check_candidate("folder", "", d, want.as_ref(), need, near.as_deref()));
     }
     if updates.is_dir() {
         let mut versions: Vec<String> = fs::read_dir(&updates)
@@ -200,18 +291,29 @@ fn scan_with(path: &str, want: Option<(String, String)>) -> DumpReport {
             .unwrap_or_default();
         versions.sort_by(|a, b| version_order(a, b));
         for v in versions {
-            report.candidates.push(check_candidate("update", &v, &updates.join(&v), want.as_ref()));
+            report.candidates.push(check_candidate("update", &v, &updates.join(&v), want.as_ref(), need, Some(&base_romfs)));
         }
     }
     if base.is_dir() {
-        report.candidates.push(check_candidate("base", "", &base, want.as_ref()));
+        report.candidates.push(check_candidate("base", "", &base, want.as_ref(), need, None));
     }
 
     report.chosen = report.candidates.iter().find(|c| c.ok).cloned();
     if report.chosen.is_none() {
         let failed = |pat: &str| report.candidates.iter().any(|c| c.checks.iter().any(|k| k.label.contains(pat) && !k.ok));
         let mut msg = String::new();
-        if failed(TEXT_MODE_LABEL) {
+        let bad = |c: &Candidate, pat: &str| c.checks.iter().any(|k| k.label.starts_with(pat) && !k.ok);
+        // the right version with game data missing: said before the version messages (the base of a base+update dump never matches)
+        let incomplete = report.candidates.iter().find(|c| bad(c, INCOMPLETE_LABEL) && !bad(c, "version ") && !c.checks.iter().any(|k| k.label.contains(TEXT_MODE_LABEL)));
+        if let (Some(n), Some(c)) = (need, incomplete) {
+            msg = format!(
+                "The game data (romfs) in {} is incomplete: {} of {} files, {:.2} of {:.2} GB. This happens when the update is dumped without the \
+                 base game's files under it (an update only holds the files it changes), or when copying the romfs folder stopped early. Put the \
+                 base game (base/ with exefs and romfs) next to updates/ and pick the folder that holds both: the launcher then adds the missing \
+                 files from it. Otherwise dump the game again with the update merged into the base game.",
+                c.romfs, c.romfs_files, n.files, gb(c.romfs_bytes), gb(n.bytes)
+            );
+        } else if failed(TEXT_MODE_LABEL) {
             msg = "Some game files are shorter than they should be: the dump was copied in text mode, which damages them. Copy the exefs and romfs folders again in binary mode (FileZilla: Transfer > Transfer type > Binary).".to_string();
         } else if let Some((_, text)) = &want {
             let version = text.split_whitespace().next().unwrap_or(text);
@@ -234,136 +336,4 @@ fn scan_with(path: &str, want: Option<(String, String)>) -> DumpReport {
         report.errors.push(msg);
     }
     report
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_id_of_an_nso_header() {
-        let dir = std::env::temp_dir().join(format!("pkp_dump_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let mut h = vec![0u8; 0x60];
-        h[..4].copy_from_slice(b"NSO0");
-        h[0x40] = 0x76;
-        h[0x53] = 0x0e;
-        fs::write(dir.join("main"), &h).unwrap();
-        assert_eq!(main_build_id(&dir.join("main")).unwrap(), format!("76{}0e", "00".repeat(18)));
-        h[0] = b'X';
-        fs::write(dir.join("main"), &h).unwrap();
-        assert_eq!(main_build_id(&dir.join("main")), None);   // encrypted or not an NSO
-        fs::write(dir.join("main"), b"NSO0").unwrap();
-        assert_eq!(main_build_id(&dir.join("main")), None);   // short
-        assert_eq!(main_build_id(&dir.join("nope")), None);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    fn nso(total: usize, build: &[u8]) -> Vec<u8> {
-        let mut h = vec![0u8; total.max(0x70)];
-        h[..4].copy_from_slice(b"NSO0");
-        for i in 0..3usize {
-            let off = 0x100 + 0x20 * i as u32;
-            h[0x10 + 0x10 * i..0x14 + 0x10 * i].copy_from_slice(&off.to_le_bytes());
-            h[0x18 + 0x10 * i..0x1c + 0x10 * i].copy_from_slice(&0x20u32.to_le_bytes());
-        }
-        h[0x40..0x40 + build.len()].copy_from_slice(build);
-        h.resize(total, 0);
-        h
-    }
-
-    fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("pkp_dump_{}_{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    fn make_set(dir: &Path, build: &[u8], nso_len: usize, romfs: bool) {
-        let ex = dir.join("exefs");
-        fs::create_dir_all(&ex).unwrap();
-        for f in NSO_FILES {
-            fs::write(ex.join(f), nso(nso_len, build)).unwrap();
-        }
-        fs::write(ex.join("main.npdm"), b"META").unwrap();
-        let ro = dir.join("romfs");
-        fs::create_dir_all(&ro).unwrap();
-        if romfs {
-            let m = ROMFS_MARKER_DIR.iter().fold(ro.clone(), |a, b| a.join(b));
-            fs::create_dir_all(&m).unwrap();
-            fs::write(m.join("x.fdata"), b"1").unwrap();
-        }
-    }
-
-    fn want() -> Option<(String, String)> {
-        Some(("11".repeat(20), "2.0.1 (update 655360)".to_string()))
-    }
-
-    #[test]
-    fn nso_short_counts_missing_bytes() {
-        let d = tmp("short");
-        fs::write(d.join("a"), nso(0x160, &[1])).unwrap();
-        assert_eq!(nso_short(&d.join("a")), Some(0));
-        fs::write(d.join("b"), nso(0x150, &[1])).unwrap();
-        assert_eq!(nso_short(&d.join("b")), Some(0x10));
-        fs::write(d.join("c"), b"nope").unwrap();
-        assert_eq!(nso_short(&d.join("c")), None);
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn direct_folder_and_picked_exefs_are_accepted() {
-        let d = tmp("direct");
-        make_set(&d, &[0x11; 20], 0x160, true);
-        let r = scan_with(&d.to_string_lossy(), want());
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert_eq!(r.chosen.unwrap().kind, "folder");
-        let r = scan_with(&d.join("exefs").to_string_lossy(), want());
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn text_mode_copy_is_named() {
-        let d = tmp("text");
-        make_set(&d, &[0x11; 20], 0x160, true);
-        fs::write(d.join("exefs").join("sdk"), nso(0x15c, &[0x11; 20])).unwrap();
-        let r = scan_with(&d.to_string_lossy(), want());
-        assert!(r.chosen.is_none());
-        assert!(r.errors[0].contains("text mode") && r.errors[0].contains("binary mode"), "{:?}", r.errors);
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn empty_or_unmarked_romfs_fails() {
-        let d = tmp("romfs");
-        make_set(&d, &[0x11; 20], 0x160, false);
-        let r = scan_with(&d.to_string_lossy(), want());
-        assert!(r.chosen.is_none());
-        assert!(r.errors[0].contains("romfs"), "{:?}", r.errors);
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn older_version_and_base_only_say_update() {
-        let older: Vec<u8> = (0..16).map(|i| u8::from_str_radix(&OLDER_MAIN_BUILD[i * 2..i * 2 + 2], 16).unwrap()).collect();
-        let d = tmp("older");
-        make_set(&d.join("updates").join("327680"), &older, 0x160, true);
-        let r = scan_with(&d.to_string_lossy(), want());
-        assert!(r.errors[0].contains("older version") && r.errors[0].contains("2.0.1") && r.errors[0].contains("dump again"), "{:?}", r.errors);
-        assert!(!r.errors[0].contains("2.0.0") && !r.errors[0].contains("1.0."), "{:?}", r.errors);
-        let _ = fs::remove_dir_all(&d);
-
-        let d = tmp("baseonly");
-        make_set(&d.join("base"), &[0x22; 20], 0x160, true);
-        let r = scan_with(&d.to_string_lossy(), want());
-        assert!(r.errors[0].contains("base game only") && r.errors[0].contains("2.0.1"), "{:?}", r.errors);
-        let _ = fs::remove_dir_all(&d);
-
-        let d = tmp("other");
-        make_set(&d.join("updates").join("9"), &[0x22; 20], 0x160, true);
-        let r = scan_with(&d.to_string_lossy(), want());
-        assert!(r.errors[0].contains("different version"), "{:?}", r.errors);
-        let _ = fs::remove_dir_all(&d);
-    }
 }

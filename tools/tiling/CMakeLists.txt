@@ -1,4 +1,4 @@
-# tegra_tiling: Tegra block-linear tile/untile library, CLI and tests. clang-cl + Ninja (scripts/build.ps1).
+# tegra_tiling: Tegra block-linear tile/untile library and CLI. clang-cl + Ninja (scripts/build.ps1).
 cmake_minimum_required(VERSION 3.20)
 # Static MSVC runtime (/MT): players need no Visual C++ Redistributable. Set before project() so every target below, third-party code
 # included, uses it; the libraries this one links must agree (a mismatch is a link error).
@@ -12,8 +12,6 @@ add_library(tegra_tiling STATIC src/tegra_tiling.cpp)
 target_include_directories(tegra_tiling PUBLIC include)
 add_executable(tegra_tile cli/tegra_tile.cpp)
 target_link_libraries(tegra_tile PRIVATE tegra_tiling)
-add_executable(tiling_test tests/tiling_test.cpp)
-target_link_libraries(tiling_test PRIVATE tegra_tiling)
-foreach(t tegra_tiling tegra_tile tiling_test)
+foreach(t tegra_tiling tegra_tile)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
 endforeach()

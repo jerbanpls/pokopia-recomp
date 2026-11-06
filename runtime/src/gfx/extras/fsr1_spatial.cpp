@@ -135,7 +135,7 @@ bool Fsr1Spatial::ensure_target(Target& t, VkExtent2D e, const char* name) {
     id.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     id.width = e.width;
     id.height = e.height;
-    id.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    id.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     id.name = name;
     std::string why;
     if (dev_->create_image(id, &t.img, &why) != VK_SUCCESS) {
@@ -172,15 +172,26 @@ void Fsr1Spatial::shutdown() {
     dev_ = nullptr;
 }
 
-VkImageView Fsr1Spatial::upscale(VkCommandBuffer cb, VkImageView src, VkExtent2D in_view, VkExtent2D in_tex, VkExtent2D out, bool linear_hdr, float prescale, float sharpness) {
+VkImageView Fsr1Spatial::upscale(VkCommandBuffer cb, VkImageView src, VkExtent2D in_view, VkExtent2D in_tex, VkExtent2D out, bool linear_hdr, float prescale, float sharpness,
+                                 VkExtent2D out_tex) {
     if (!dev_ || !src || !out.width || !out.height || !in_view.width || !in_view.height) return VK_NULL_HANDLE;
-    if (!ensure_target(easu_img_, out, "fsr easu") || !ensure_target(rcas_img_, out, "fsr rcas")) return VK_NULL_HANDLE;
+    // the result image may be larger than out (both passes write and read only inside out: opt.yz); the EASU intermediate is out
+    const VkExtent2D res{std::max(out.width, out_tex.width), std::max(out.height, out_tex.height)};
+    if (!ensure_target(easu_img_, out, "fsr easu") || !ensure_target(rcas_img_, res, "fsr rcas")) return VK_NULL_HANDLE;
     VkDevice d = dev_->device();
+    const bool fresh = !rcas_img_.initialised;
     for (Target* t : {&easu_img_, &rcas_img_}) {
         image_barrier(cb, t->img.image, t->initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT);
         t->initialised = true;
+    }
+    if (fresh && (res.width > out.width || res.height > out.height)) {   // a result image larger than out: zero it once (the draw that samples it may touch the texel past out; no NaN from undefined memory)
+        const VkClearColorValue zero{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, rcas_img_.img.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+        image_barrier(cb, rcas_img_.img.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT);
     }
     const float perceptual = linear_hdr ? 1.0f : 0.0f;
     {   // EASU

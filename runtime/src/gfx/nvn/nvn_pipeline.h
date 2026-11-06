@@ -121,20 +121,51 @@ void prewarm_record(const GraphicsKey& key);                              // a d
 size_t prewarm_program(const ShaderInfo* const stages[6]);                // a program got its shaders: its recorded pipelines go first in line (how many)
 // True with *out: the pipeline was built ahead. False: build it here, except that when a background build of it is under way and can_link()
 // says the draw can link it from parts now, *later gets the whole pipeline that will replace the linked one (link with no upgrade of its own).
-bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later);
+// no_wait ([nvn] async_whole): a build that is queued or running is neither waited for nor taken over by the draw; *later gets it instead
+// (a queued one moves to the front) and the draw goes without a pipeline until it is ready.
+bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later,
+                  bool no_wait = false);
 void prewarm_shutdown();                                                  // stops the workers (before the device is torn down)
 struct PrewarmStats {
     uint64_t recorded = 0, loaded = 0, queued = 0, built = 0, taken = 0, waited = 0, claimed = 0;
     uint64_t failed = 0, promoted = 0, linked_meanwhile = 0;   // builds that failed; jobs moved ahead by a program set; draws linked while the whole build ran
+    uint64_t no_wait = 0;                                      // [nvn] async_whole: draws that went without a pipeline instead of waiting for this build
     double wait_ms = 0;
 };
 PrewarmStats prewarm_stats();
+// [nvn] compute_prewarm: the key file also holds compute records (shader hash + compute_layout_key), written when a compute pipeline is
+// created (any thread) and built on the prewarm workers at boot (compute_build_ahead). A no-op when the key is false.
+void prewarm_record_compute(const ShaderInfo* cs, uint64_t layout_key);
+
+// ---- compute pipelines (nvn_pipeline.cpp) ---------------------------------------------------------------------------------------
+// Found by shader content (cache hash) and pipeline layout, so one built ahead from a stand-in shader serves the game's own.
+// Render thread: built here when nobody has it, waited for when a background thread is building it (the dispatch path, as before).
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout);
+bool compute_pipeline_done(const ShaderInfo* cs, const ProgLayout& layout);   // built (or failed): compute_pipeline returns at once
+// [nvn] async_compute (default true). A compute program the game sets is queued for the async threads (its layout derived there); a dispatch
+// whose pipeline is missing in play goes first in line (compute_queue_front; false: the threads are stopped, build it at the dispatch).
+bool async_compute_on();
+bool compute_prewarm_on();
+void compute_program_set(const ShaderInfo* cs);                               // any thread (nvnProgramSetShaders, through prewarm_program_shaders)
+bool compute_queue_front(const ShaderInfo* cs, const ProgLayout& layout);     // render thread
+bool compute_build_ahead(const ShaderInfo* cs, uint64_t layout_key);          // prewarm worker: false when the layout no longer matches
+uint64_t compute_layout_key(const ProgLayout& layout);                        // the descriptor shape (stable between runs)
+void compute_note_skipped();                                                  // do_dispatch skipped a dispatch while its pipeline builds
+struct ComputeStats { uint64_t skipped = 0, at_dispatch = 0, prewarmed = 0, background = 0; };
+ComputeStats compute_stats();
 VkShaderModule shader_module(const ShaderInfo* s);
 // A content id of a shader module (hash of the words it was made from): two modules made from the same words have the same id, so the shader
 // parts built for the stand-in shaders of the key file are found again by the game's own. Any thread.
 uint64_t module_content_id(VkShaderModule m);
 uint64_t pipelines_built_at_draw();          // whole pipelines the render thread built itself at a draw (session)
+// [nvn] async_whole (default true on every platform; `auto` means true). In play (the loading gate, gpl_gate_open), a pipeline that would
+// be built whole on the render thread at a draw (no key-file build, no pipeline-library link: depth-only draws, feedback loops, tessellation,
+// a driver without VK_EXT_graphics_pipeline_library) is built on a background thread instead, and the draw is skipped until it is ready (a
+// missing object for a frame or two instead of a 5-50 ms hitch). Draws no longer wait for a key-file build that is running either.
+// Stream-out draws, and every draw while the game loads, are built at the draw as before. Off with [nvn] gpl_ab.
+bool async_whole_on();                       // first call reads the setting
+uint64_t pipelines_built_async();            // whole pipelines built in the background for a skipped draw (session)
+uint64_t draws_skipped_async();              // draws skipped while their pipeline was built in the background (session)
 // Bytes of one captured vertex of the vertex shader's transform feedback variant (0: none could be made).
 uint32_t xfb_stride(const ShaderInfo* vs);
 
@@ -156,10 +187,18 @@ struct PipeUpgrade {
 };
 // null: not possible for this key, build it whole. *up (when given) gets the upgrade the linked pipeline will be replaced by (null: none queued).
 VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::shared_ptr<PipeUpgrade>* up = nullptr, bool* pending = nullptr);
-// [nvn] gpl_async: a draw whose shader parts are not compiled yet gets no pipeline while frames are flowing (*pending = true: skip it and ask
-// again later); the parts compile on the background threads ahead of everything else. While the game loads (no present for 100 ms) the draw
-// builds them itself as before, so one-time renders of a loading screen are never lost.
+// [nvn] gpl_async: a draw any of whose four parts is not done yet (absent, or being built by another thread) gets no pipeline while the
+// loading gate is open (gpl_gate_open; *pending = true: skip it and ask again later); the missing parts compile on the background threads
+// ahead of everything else. While the game loads the draw builds or waits for them itself as before, so one-time renders of a loading screen
+// are never lost.
 void gpl_note_presents(uint64_t presents);   // the replay, once per submission: when presents were last seen moving
+bool gpl_frames_flowing();                   // a present was seen in the last 100 ms (the game is not loading)
+// The loading gate ([nvn] gpl_gate, render thread only). True = the game is in play: nothing is compiled or waited for at a draw or a
+// dispatch (the draw or dispatch is skipped while its pipeline builds in the background). `state` (default): the replay's frame detector
+// (replay_loading), latched once per submission with gpl_latch_play; `time`: gpl_frames_flowing at every call (the old rule). While the
+// gate is closed (loading) everything is built at the draw as before, so one-time renders of a loading screen are never lost.
+void gpl_latch_play(bool play);              // replay_begin_submit, once per submission: !replay_loading()
+bool gpl_gate_open();
 bool gpl_ab_whole();                                                 // measurement only ([nvn] gpl_ab): true in the windows that run the optimised pipelines
 void gpl_take_upgrade(VkPipeline& current, VkPipeline& alt, std::shared_ptr<PipeUpgrade>& up);   // render thread: swaps in the finished optimised pipeline (the old one is destroyed once the GPU is done with it)
 void gpl_program(const ShaderInfo* const stages[6], bool covered);   // a program got its shaders: queue its shader parts (covered: the key file has pipelines for it, skip)
@@ -179,6 +218,7 @@ struct GplStats {
     uint64_t jobs_pending = 0;                       // shader-part jobs queued or running at this moment (0 once every job queued so far has finished)
     uint64_t prog_set = 0, prog_covered = 0, prog_new = 0, prog_bound = 0, prog_bound_new = 0, jobs_run = 0, jobs_no_layout = 0, jobs_no_modules = 0;
     uint64_t draws_deferred = 0, parts_async = 0;    // [nvn] gpl_async: draws skipped while their parts compiled, parts compiled for them
+    uint64_t draws_deferred_in_flight = 0;           // of those, draws a part of which another thread was building (the old path waited: pipe.libwait)
     uint64_t prog_single = 0;                        // programs with only one of vertex and fragment shader (Pokopia sets them apart): nothing to queue per program
     uint64_t prebuild_jobs = 0, prebuild_run = 0;    // key-file keys whose parts were queued, run
     double link_ms = 0, draw_part_ms = 0, wait_ms = 0, worker_ms = 0;

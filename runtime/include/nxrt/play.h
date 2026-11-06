@@ -45,7 +45,7 @@ std::string settings_path();
 
 struct StartOptions {
     gfx::Device* device = nullptr;          // needed for the overlay
-    gfx::Renderer* renderer = nullptr;      // needed for the overlay and for present-mode changes; null = no graphics (unit tests)
+    gfx::Renderer* renderer = nullptr;      // needed for the overlay and for present-mode changes; null = no graphics
     bool window = false;                    // a platform window exists: pump its events, capture the pointer, fullscreen, quit on close
     bool overlay = true;                    // create the F1 overlay (needs device and renderer)
 };

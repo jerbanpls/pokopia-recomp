@@ -12,4 +12,11 @@ namespace nxrt {
 // touchscreen or on-screen keyboard send mouse or keyboard input.
 bool host_is_handheld();
 
+// A Steam Deck (LCD or OLED) only: Steam's SteamDeck=1 or the board Jupiter / Galileo (same sources as above; [host] handheld does not
+// change it). For defaults tied to the Deck's fixed-refresh panel, such as [display] fps_snap auto.
+bool host_is_steam_deck();
+
+// Running under Wine (Proton, SteamOS): ntdll exports wine_get_version. Read once; any thread.
+bool host_is_wine();
+
 }  // namespace nxrt

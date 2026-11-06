@@ -17,6 +17,8 @@
 #include "nxrt/extras.h"
 #include "extras/temporal.h"
 #include "nxrt/frame_limiter.h"
+#include "nxrt/gfx_tuning.h"
+#include "nxrt/host_device.h"
 #include "nxrt/input_source.h"
 #include "nxrt/lowlat.h"
 #include "nxrt/overlay.h"
@@ -40,7 +42,7 @@ constexpr const char* kWindowModeNames[kWindowModeCount] = {"Windowed", "Borderl
 constexpr const char* kWindowModeKeys[kWindowModeCount] = {"windowed", "borderless", "exclusive"};
 constexpr int kSizePresets[][2] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
 constexpr int kSizePresetCount = static_cast<int>(sizeof kSizePresets / sizeof kSizePresets[0]);
-constexpr int kFpsChoices[] = {-1, 0, 30, 60, 72, 90, 120, 144, 165, 240, 360};   // -1 = the refresh rate
+constexpr int kFpsChoices[] = {-1, 0, 30, 40, 45, 60, 72, 90, 120, 144, 165, 240, 360};   // -1 = the refresh rate
 // The aspect ratio combo: Auto stores 0, the presets store their ratio, Custom shows a slider (index kAspectCustom, no value of its own).
 constexpr const char* kAspectNames[] = {"Auto", "16:9", "16:10", "21:9", "32:9", "Custom"};
 constexpr double kAspectValues[] = {0.0, 16.0 / 9.0, 1.6, 21.0 / 9.0, 32.0 / 9.0};
@@ -754,7 +756,24 @@ void upscale_group(Page& p) {
     if (slider("Sharpness", &u.sharpness, 0.0, 1.0, "%.2f")) mark(p);
     tip("How much FSR 1, NIS or FSR 3 sharpens the upscaled picture; 1 is the sharpest (DLSS has no sharpening).");
     if (ImGui::SliderInt("Scene resolution##upscale_scene", &u.scene_scale, 25, 100, "%d%%")) mark(p);
-    tip("Renders the 3D scene at this percent of the output size per side; the game scales it up and keeps the HUD and the post effects at full size. 100 turns it off. Applies live.");
+    tip("Renders the 3D scene at this percent of the output size per side; the game scales it up and keeps the HUD and the post effects at full size. 100 turns it off. "
+        "FSR 3 and DLSS use their quality preset's percent instead, unless it is Custom. Applies live.");
+    {   // what is in force now (#116): the percent the game module applies and who enlarges the scene
+        const int pct = extras::upscale_scene_scale();
+        float fx = 1.0f, fy = 1.0f;
+        extras::scene_fraction(&fx, &fy);
+        const extras::UpscaleMode m = extras::upscale_mode();
+        if (pct >= 100) {
+            ImGui::TextDisabled("Scene: full size%s", extras::upscale_temporal() ? " (the temporal upscaler runs as anti-aliasing)" : "");
+        } else if (fx >= 1.0f && fy >= 1.0f) {
+            ImGui::TextDisabled("Scene: %d%% per side, stretched by the game (dynamic resolution or split screen on, or not in the game yet)", pct);
+        } else {
+            const char* who = m == extras::UpscaleMode::Fsr1 ? "upscaled with FSR 1" : m == extras::UpscaleMode::Nis ? "upscaled with NIS"
+                            : m == extras::UpscaleMode::Fsr3 ? "upscaled with FSR 3" : m == extras::UpscaleMode::Dlss ? "upscaled with DLSS"
+                            : "stretched by the game (pick an upscaler to make it sharper)";
+            ImGui::TextDisabled("Scene: %d%% per side, %s", pct, who);
+        }
+    }
     ImGui::TextDisabled("Or render everything below the window size with the render scale above; the upscaler then fills the rest.");
 }
 
@@ -854,7 +873,10 @@ void window_group(const LiveStatus& live, Page& p) {
         if (kSizePresets[i][0] == d.width && kSizePresets[i][1] == d.height) preset = i;
     char size_label[48];
     std::snprintf(size_label, sizeof size_label, "%d x %d%s", d.width, d.height, preset < 0 ? " (custom)" : "");
-    if (ImGui::BeginCombo("Window size", size_label)) {
+    // Only the windowed mode's size; the picture's own size is under Resolution. Greyed out in the fullscreen modes (#117).
+    const bool windowed = window_mode_index(d.window_mode) == window_mode_index("windowed");
+    ImGui::BeginDisabled(!windowed);
+    if (ImGui::BeginCombo("Windowed size", size_label)) {
         for (int i = 0; i < kSizePresetCount; ++i) {
             char name[32];
             std::snprintf(name, sizeof name, "%d x %d", kSizePresets[i][0], kSizePresets[i][1]);
@@ -866,10 +888,13 @@ void window_group(const LiveStatus& live, Page& p) {
         }
         ImGui::EndCombo();
     }
-    tip("The size of the game window in windowed mode. It changes at once when the window is windowed; in fullscreen it is the size the window returns to.");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", windowed ? "The size of the game window in windowed mode. It is not the size the game renders at: see Resolution below."
+                                         : "Only used in windowed mode: the size the window returns to. Fullscreen shows the display's size; the size "
+                                           "the game renders at is under Resolution below.");
     if (int_field("Width##win_w", &d.width, 320, 16384, 1, 100)) mark(p);
     if (int_field("Height##win_h", &d.height, 320, 16384, 1, 100)) mark(p);
-    if (live.width > 0 && (live.width != d.width || live.height != d.height)) {
+    if (windowed && live.width > 0 && (live.width != d.width || live.height != d.height)) {
         if (ImGui::Button("Use the current window size")) {
             d.width = live.width;
             d.height = live.height;
@@ -878,6 +903,7 @@ void window_group(const LiveStatus& live, Page& p) {
         ImGui::SameLine();
         ImGui::TextDisabled("now %d x %d", live.width, live.height);
     }
+    ImGui::EndDisabled();
     if (ImGui::Checkbox("Keep the 16:9 picture, letterbox the rest", &d.keep_aspect)) mark(p);
 }
 
@@ -895,15 +921,38 @@ void framerate_group(UiHost& host, const LiveStatus& live, Page& p) {
             fps_label(fps, name, sizeof name);
             if (ImGui::Selectable(name, fps == d.fps_cap) && fps != d.fps_cap) {
                 d.fps_cap = fps;
+                quality_preset_edited(d, QualityField::FrameLimit);
                 mark(p);
             }
         }
         ImGui::EndCombo();
     }
     tip("Refresh rate follows the display. With vsync on, a limit only counts when it is below the refresh rate.");
+    {   // [display] fps_snap: on by default on a detected Steam Deck only (auto); this box writes true / false
+        const bool deck = nxrt::host_is_steam_deck();
+        bool snap = d.fps_snap == "true" || (d.fps_snap == "auto" && deck);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.85f, 1.0f, 1.0f));
+        if (ImGui::Checkbox("Cap FPS to 30 for Steam Deck", &snap)) {
+            d.fps_snap = snap ? "true" : "false";
+            mark(p);
+        }
+        ImGui::PopStyleColor();
+        tip("The Steam Deck's screen refreshes at a fixed 90 Hz (OLED) or 60 Hz (LCD) and cannot follow the game. At 40 fps, frames stay on "
+            "screen for uneven times, which feels like stutter; at 30 every frame stays for the same time. Needs vsync on. With a higher limit "
+            "it takes the next even step instead (60 becomes 45 at 90 Hz). Off: your frame limit stays exactly as set.");
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.0f, 1.0f), "THIS ACTUALLY MAKES THE GAME SMOOTHER on a Steam Deck.");
+        ImGui::TextDisabled(deck ? "On by default on this Steam Deck. Untick it to keep your frame limit exactly as set."
+                                 : "Off by default here: this is not a Steam Deck. Tick it only on a screen without G-Sync / FreeSync.");
+        if (snap && !d.vsync) ImGui::TextColored(kOrange, "Turn vsync on for this to work.");
+    }
+    if (live.snap_k >= 2 && d.fps_cap > 0) {
+        ImGui::TextDisabled("%d (runs at %g on this %g Hz screen%s)", d.fps_cap, live.snap_cap, static_cast<double>(live.refresh_hz),
+                            d.fps_cap == 40 ? "; set 80 Hz in Steam's Performance menu for 40" : "; pick a refresh rate that is a multiple of it");
+    }
     ImGui::BeginDisabled(live.refresh_hz <= 0.0f);
     if (ImGui::Button("Just under the refresh rate")) {
         d.fps_cap = static_cast<int>(std::floor(nxrt::suggest_vrr_cap(live.refresh_hz)));
+        quality_preset_edited(d, QualityField::FrameLimit);
         mark(p);
     }
     ImGui::EndDisabled();
@@ -914,18 +963,48 @@ void framerate_group(UiHost& host, const LiveStatus& live, Page& p) {
     fps_group(host, p);
 }
 
+// The size the game renders at and what happens to it on the way to the screen, live (#117): the picture the NVN back end presented last
+// (the window texture's crop at the render scale) against the swapchain size, and the upscaler that fills the difference.
+void render_size_line() {
+    const gfx::Tuning& tu = gfx::tuning();
+    const int sw = tu.present_src_w.load(std::memory_order_relaxed), sh = tu.present_src_h.load(std::memory_order_relaxed);
+    const int ow = tu.present_out_w.load(std::memory_order_relaxed), oh = tu.present_out_h.load(std::memory_order_relaxed);
+    if (sw <= 0 || sh <= 0 || ow <= 0 || oh <= 0) {
+        ImGui::TextDisabled("Rendering: not known yet (no frame presented)");
+        return;
+    }
+    const extras::UpscaleMode m = extras::upscale_mode();
+    const char* how = "stretched";
+    if (sw > ow || sh > oh) how = "scaled down";
+    else if (m == extras::UpscaleMode::Fsr1) how = "upscaled with FSR 1";
+    else if (m == extras::UpscaleMode::Nis) how = "upscaled with NIS";
+    if (sw == ow && sh == oh) {
+        ImGui::Text("Rendering %d x %d, shown at that size (no upscaling)", sw, sh);
+    } else {
+        ImGui::Text("Rendering %d x %d -> %s to %d x %d", sw, sh, how, ow, oh);
+        if (sw < ow && sh <= oh && m != extras::UpscaleMode::Fsr1 && m != extras::UpscaleMode::Nis)
+            ImGui::TextDisabled("Below the output size: FSR 1 or NIS (Graphics page) upscale it sharper than the plain stretch.");
+    }
+    tip("The game's picture size right now (its targets times the render scale) and the size it is shown at (the window or the display).");
+}
+
 void resolution_group(Page& p) {
     DisplaySettings& d = p.edit.display;
     ImGui::SeparatorText("Resolution");
+    render_size_line();
     bool autos = d.render_scale <= 0;
     if (ImGui::Checkbox("Automatic render scale", &autos)) {
         d.render_scale = autos ? 0 : 100;
+        quality_preset_edited(d, QualityField::RenderScale);
         mark(p);
     }
     tip("Auto renders at the size of the window (never below the game's own 1080p). Turn it off to pick a percentage.");
     restart_badge();
     if (!autos) {
-        if (ImGui::SliderInt("Render scale", &d.render_scale, 25, 400, "%d%%")) mark(p);
+        if (ImGui::SliderInt("Render scale", &d.render_scale, 25, 400, "%d%%")) {
+            quality_preset_edited(d, QualityField::RenderScale);
+            mark(p);
+        }
         tip("The game's internal resolution as a percentage of its own size (100% = 1920 x 1080). Above 100% renders more pixels than the console did.");
         restart_badge();
     }
@@ -933,24 +1012,66 @@ void resolution_group(Page& p) {
 
 // ---- Graphics -----------------------------------------------------------------------------------------------------------------------
 
-// The game's quality preset (kDisplayOptQuality): picking one writes its view distance, texture LOD bias and anisotropy; changing one of
-// those afterwards makes it Custom.
-constexpr const char* kQualityIds[] = {"switch2", "high", "ultra", "custom"};
-constexpr const char* kQualityNames[] = {"Switch 2 (console)", "High", "Ultra", "Custom"};
-constexpr int kQualityCount = 4;
+// The game's quality preset (kDisplayOptQuality, the presets of play_types.h quality_presets()): picking one writes its values (view
+// distance, texture LOD bias and anisotropy; a device preset also the render scale and the frame limit); changing one of those afterwards
+// makes it Custom (quality_preset_edited).
+
+// What a preset sets, in plain words, from the values the game's hook writes.
+std::string quality_preset_summary(const QualityPresetInfo& q, const GamePlay* gp, const DisplaySettings& now) {
+    std::string t = q.about;
+    if (!gp || !gp->quality_preset) return t;
+    DisplaySettings v = now;
+    if (!gp->quality_preset(q.id, v)) return t;
+    char buf[160];
+    t += "\n";
+    if (q.sets_frame) {
+        if (v.render_scale <= 0) {
+            t += "Render scale: automatic (the window's size). ";
+        } else {
+            std::snprintf(buf, sizeof buf, "Render scale: %d%% (%d x %d). ", v.render_scale, 1920 * v.render_scale / 100, 1080 * v.render_scale / 100);
+            t += buf;
+        }
+        if (v.fps_cap < 0) {
+            t += "Frame limit: the display's refresh rate. ";
+        } else if (v.fps_cap == 0) {
+            t += "Frame limit: none. ";
+        } else {
+            std::snprintf(buf, sizeof buf, "Frame limit: %d fps. ", v.fps_cap);
+            t += buf;
+        }
+    }
+    std::snprintf(buf, sizeof buf, "View distance: x%.3g. ", v.view_distance);
+    t += buf;
+    if (v.anisotropy > 0) {
+        std::snprintf(buf, sizeof buf, "Texture filtering: %dx. ", v.anisotropy);
+        t += buf;
+    } else {
+        t += "Texture filtering: the game's. ";
+    }
+    t += v.lod_bias < 0 ? "Textures: sharper." : v.lod_bias > 0 ? "Textures: softer." : "Textures: the game's sharpness.";
+    if (q.sets_frame) t += "\nThe render scale applies on restart.";
+    return t;
+}
 
 void quality_preset_combo(Page& p, const GamePlay* gp) {
     DisplaySettings& d = p.edit.display;
-    int sel = kQualityCount - 1;
-    for (int i = 0; i < kQualityCount; ++i)
-        if (d.quality_preset == kQualityIds[i]) sel = i;
-    if (ImGui::BeginCombo("Quality preset", kQualityNames[sel])) {
-        for (int i = 0; i < kQualityCount - 1; ++i) {
-            if (ImGui::Selectable(kQualityNames[i], i == sel) && i != sel && gp->quality_preset && gp->quality_preset(kQualityIds[i], d)) mark(p);
+    int count = 0;
+    const QualityPresetInfo* qs = quality_presets(&count);
+    int sel = count - 1;   // custom
+    for (int i = 0; i < count; ++i)
+        if (d.quality_preset == qs[i].id) sel = i;
+    if (ImGui::BeginCombo("Quality preset", qs[sel].name)) {
+        for (int i = 0; i < count - 1; ++i) {
+            if (ImGui::Selectable(qs[i].name, i == sel) && i != sel && gp->quality_preset && gp->quality_preset(qs[i].id, d)) mark(p);
+            if (ImGui::IsItemHovered()) {
+                const std::string t = quality_preset_summary(qs[i], gp, d);
+                ImGui::SetItemTooltip("%s", t.c_str());
+            }
         }
         ImGui::EndCombo();
     }
-    tip("Sets the view distance, texture LOD bias and anisotropy together. Switch 2 is the console's picture.");
+    tip("Sets several picture settings together. Switch 2 is the console's picture; High and Ultra are sharper and reach farther. The device "
+        "presets also pick a render scale and a frame limit for that kind of PC. Changing one of those settings afterwards makes it Custom.");
 }
 
 void picture_group(Page& p) {
@@ -1000,12 +1121,12 @@ void picture_group(Page& p) {
 
     const bool quality = (opts & kDisplayOptQuality) != 0;
     if (quality) quality_preset_combo(p, gp);
-    auto custom = [&] {
-        if (quality) d.quality_preset = "custom";
+    auto custom = [&](QualityField f) {
+        if (quality) quality_preset_edited(d, f);
         mark(p);
     };
     if (quality) {
-        if (slider("View distance", &d.view_distance, 1.0, 4.0, "x%.2f")) custom();
+        if (slider("View distance", &d.view_distance, 1.0, 4.0, "x%.2f")) custom(QualityField::ViewDistance);
         tip("Multiplies the camera's far clip: terrain and large scenery reach farther. 1 is the console's.");
     }
     int aniso_sel = 0;
@@ -1015,13 +1136,13 @@ void picture_group(Page& p) {
         for (int i = 0; i < kAnisoCount; ++i) {
             if (ImGui::Selectable(kAnisoNames[i], i == aniso_sel) && i != aniso_sel) {
                 d.anisotropy = kAnisoValues[i];
-                custom();
+                custom(QualityField::Anisotropy);
             }
         }
         ImGui::EndCombo();
     }
     tip("Sharper textures at a slant. Game default keeps what the game asks for; the other entries are a minimum on every filtering sampler.");
-    if (slider("Texture LOD bias", &d.lod_bias, -2.0, 2.0, "%.2f")) custom();
+    if (slider("Texture LOD bias", &d.lod_bias, -2.0, 2.0, "%.2f")) custom(QualityField::LodBias);
     tip("Negative values pick sharper texture levels, positive values softer ones.");
     if (opts & kDisplayOptBloom) {
         if (ImGui::Checkbox("Bloom", &d.bloom)) mark(p);

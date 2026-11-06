@@ -19,6 +19,7 @@
 #include "nvn_core.h"
 #include "nvn_gpu.h"
 #include "nvn_impl.h"
+#include "nxrt/ftrace.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
 
@@ -402,7 +403,8 @@ void texture_pool_register(const NVNtexturePool* pool, int id, const NVNtexture*
     }
     Texture* t = host_of<Texture>(texture);
     const TextureViewInfo info = view ? decode(view) : TextureViewInfo{};
-    std::unique_lock<std::shared_mutex> lk(tp->lock);
+    std::unique_lock<std::shared_mutex> lk(tp->lock, std::defer_lock);
+    { NXFT("tex.pool_register.lock"); lk.lock(); }      // the wait for readers of the pool's entries (a draw resolving texture ids)
     TexturePool::Entry& e = tp->entries[static_cast<size_t>(id)];
     e.tex = Ref<Texture>::share(t);
     e.view = info;

@@ -3,6 +3,7 @@
   "program_id": "0400A3A01EE4C000",
   "version": "2.0.1 (update 655360)",
   "main_build_id": "76a489f3bd3642fa5e18bd83d32c98bacc5f7d0e",
+  "romfs": {"files": 36, "bytes": 7246052773},
   "sha256": {
     "main": "8a8ce87b4edfce88c6260da5dd80d6cafc03a761eebc842d7a3476e353a8336f",
     "sdk": "7c12078e9f853f5d77f395155f7308f264fa6e93fadaeba8dca525f4483c09b2",

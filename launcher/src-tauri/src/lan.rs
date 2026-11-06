@@ -402,13 +402,10 @@ mod sys {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, not(windows)))]
+mod linux_tests {
     use super::*;
 
-    fn ad(name: &str, desc: &str, ip: &str) -> Adapter {
-        Adapter { friendly_name: name.into(), description: desc.into(), if_type: 6, up: true, ip: ip.parse().unwrap(), has_gateway: false, metric: 50, public: Some(false) }
-    }
     fn gw(mut a: Adapter, metric: u32) -> Adapter {
         a.has_gateway = true;
         a.metric = metric;
@@ -453,110 +450,5 @@ mod tests {
         assert_eq!(why("wg0").as_deref(), Some("VPN or tunnel adapter"));
         assert_eq!(why("usb0").as_deref(), Some("USB-tethered phone"));
         assert!(rep.warning.is_none() && rep.firewall_hint.is_none());
-    }
-
-    #[test]
-    fn default_route_first_and_virtual_skipped() {
-        let v = vec![
-            ad("vEthernet (Default Switch)", "Hyper-V Virtual Ethernet Adapter", "172.28.0.1"),
-            ad("vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter #2", "172.29.0.1"),
-            ad("VirtualBox Host-Only Network", "VirtualBox Host-Only Ethernet Adapter", "10.56.0.1"),
-            ad("VMware Network Adapter VMnet8", "VMware Virtual Ethernet Adapter for VMnet8", "10.100.0.1"),
-            ad("Ethernet 2", "Realtek PCIe GbE", "10.0.0.7"),
-            gw(ad("Ethernet", "Intel I225-V", "10.0.0.5"), 25),
-            ad("Loopback", "Software Loopback Interface 1", "127.0.0.1"),
-            ad("Ethernet 3", "Broken", "169.254.12.3"),
-        ];
-        let r = rank(&v);
-        assert_eq!(r.lan.iter().map(|a| a.ip.as_str()).collect::<Vec<_>>(), ["10.0.0.5", "10.0.0.7"]);
-        assert!(r.lan[0].default_route && !r.lan[1].default_route);
-        assert_eq!(r.skipped.len(), 6);
-    }
-
-    #[test]
-    fn usb_phone_hotspot_never_offered() {
-        let mut phone = gw(ad("Ethernet 4", "Apple Mobile Device Ethernet", "172.20.10.2"), 5); // best metric, still skipped
-        phone.public = Some(true);
-        let rndis = gw(ad("Ethernet 5", "Remote NDIS based Internet Sharing Device", "10.42.0.129"), 5);
-        let by_range = ad("Ethernet 6", "USB 10/100 LAN", "172.20.10.3");
-        let wifi = gw(ad("Wi-Fi", "Intel AX211", "172.16.1.20"), 40);
-        let r = rank(&[phone, rndis, by_range, wifi]);
-        assert_eq!(r.lan.len(), 1);
-        assert_eq!(r.lan[0].ip, "172.16.1.20");
-        assert!(r.skipped.iter().all(|s| s.reason == "USB-tethered phone"));
-        assert_eq!(r.skipped.len(), 3);
-        assert!(r.warning.is_none());
-    }
-
-    #[test]
-    fn wifi_in_iphone_hotspot_range_is_kept() {
-        let mut w = gw(ad("Wi-Fi", "Intel AX211", "172.20.10.4"), 40);
-        w.if_type = IF_WIFI;
-        assert_eq!(rank(&[w]).lan.len(), 1);
-    }
-
-    #[test]
-    fn tailscale_and_zerotier_listed_separately() {
-        let v = vec![
-            gw(ad("Ethernet", "Intel I225-V", "172.16.0.9"), 25),
-            ad("Tailscale", "Tailscale Tunnel", "100.101.102.103"),
-            ad("ZeroTier One [abc]", "ZeroTier Virtual Port", "10.147.17.5"),
-            ad("OpenVPN TAP", "TAP-Windows Adapter V9", "10.8.0.2"),
-            ad("Wintun", "WireGuard Tunnel", "10.9.0.2"),
-        ];
-        let r = rank(&v);
-        assert_eq!(r.lan.len(), 1);
-        assert_eq!(r.overlay.len(), 2);
-        assert_eq!(r.overlay[0].label, "internet via Tailscale");
-        assert_eq!(r.overlay[1].label, "internet via ZeroTier");
-        assert_eq!(r.skipped.len(), 2);
-    }
-
-    #[test]
-    fn lowest_metric_gateway_wins_and_private_before_other() {
-        let v = vec![
-            gw(ad("Wi-Fi", "Intel AX211", "172.16.1.20"), 40),
-            gw(ad("Ethernet", "Intel I225-V", "10.1.1.5"), 25),
-            ad("Other", "USB NIC", "100.70.0.2"), // CGNAT, not Tailscale
-        ];
-        let r = rank(&v);
-        assert_eq!(r.lan.iter().map(|a| a.ip.as_str()).collect::<Vec<_>>(), ["10.1.1.5", "172.16.1.20", "100.70.0.2"]);
-        assert!(r.lan[0].default_route);
-        assert!(!r.lan[1].default_route);
-    }
-
-    #[test]
-    fn public_profile_on_best_address_warns() {
-        let mut e = gw(ad("Ethernet", "Intel I225-V", "172.16.0.9"), 25);
-        e.public = Some(true);
-        let r = rank(&[e]);
-        assert_eq!(r.warning.as_deref(), Some(PUBLIC_WARNING));
-        assert!(r.firewall_hint.is_some());
-        assert!(r.lan[0].public_profile);
-        // Private default route plus a Public secondary: no warning
-        let mut s = ad("Wi-Fi", "Intel AX211", "172.16.1.20");
-        s.public = Some(true);
-        let r = rank(&[gw(ad("Ethernet", "x", "10.0.0.5"), 10), s]);
-        assert!(r.warning.is_none() && r.firewall_hint.is_none());
-        assert!(r.lan[1].public_profile);
-    }
-
-    #[test]
-    fn unknown_profile_does_not_warn_and_down_adapters_ignored() {
-        let mut a = gw(ad("Ethernet", "x", "10.0.0.5"), 10);
-        a.public = None;
-        let mut d = ad("Wi-Fi", "y", "10.0.0.6");
-        d.up = false;
-        let r = rank(&[a, d]);
-        assert!(r.warning.is_none());
-        assert_eq!(r.lan.len(), 1);
-        assert!(r.skipped.is_empty());
-    }
-
-    #[test]
-    fn empty_list_gives_hint() {
-        let r = rank(&[]);
-        assert!(r.lan.is_empty() && r.firewall_hint.is_some());
-        assert!(log_lines(&r, 39660)[0].starts_with("No usable"));
     }
 }

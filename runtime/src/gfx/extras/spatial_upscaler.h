@@ -14,9 +14,10 @@ public:
     virtual ~SpatialUpscaler() = default;
     // Records into cb (outside any render pass). src: a view of an image in SHADER_READ_ONLY_OPTIMAL; in_view: the part of it to upscale (from texel 0, 0);
     // in_tex: the whole image; out: the size of the result. linear_hdr: scene-linear float input, compressed with pre-scale k around the filter.
-    // sharpness 0..1. Returns a view of the result (GENERAL layout, readable by compute and fragment shaders after the recorded barrier), or null.
+    // sharpness 0..1. out_tex: the size of the result image when larger than out (the result fills its top-left out-sized corner, the rest is
+    // undefined); {} = out. Returns a view of the result (GENERAL layout, readable by compute and fragment shaders after the recorded barrier), or null.
     virtual VkImageView upscale(VkCommandBuffer cb, VkImageView src, VkExtent2D in_view, VkExtent2D in_tex, VkExtent2D out, bool linear_hdr, float prescale,
-                                float sharpness) = 0;
+                                float sharpness, VkExtent2D out_tex = {}) = 0;
     // True when this upscaler can scale in_view to out (NIS: 1x to 2x per side).
     virtual bool supports(VkExtent2D in_view, VkExtent2D out) const { (void)in_view; (void)out; return true; }
 };

@@ -11,8 +11,9 @@
 //   fragment output  blend, attachment formats, samples                        (cheap, made at the draw)
 //
 // When the game sets a program's shaders (nvnProgramSetShaders, at load time) the two shader parts are queued for the background threads;
-// the draw makes the cheap parts and links the four, which takes a fraction of a millisecond. A part that is not ready is built (or waited
-// for) by the draw, so the worst case is the cost of one shader part. Nothing is guessed that could end in a second compile: a part is
+// the draw makes the cheap parts and links the four, which takes a fraction of a millisecond. In play ([nvn] gpl_async, the loading gate
+// below) a draw with a part that is not ready is deferred while the part goes first in line; while loading the draw builds (or waits for) it,
+// so the worst case there is the cost of one shader part. Nothing is guessed that could end in a second compile: a part is
 // keyed by exactly what it was compiled with (module, layout, raster flags), a draw whose flags differ from the prebuilt ones builds its own
 // part and teaches the prediction (the flags are added to the set that later programs get ahead).
 //
@@ -49,6 +50,7 @@
 #include "nxrt/config.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gauge.h"
+#include "nxrt/host_device.h"
 #include "nxrt/log.h"
 #include "nxrt/overlay.h"
 #include "nvn_format_guard.h"
@@ -582,6 +584,9 @@ void upgrade_main() {
     }
 }
 
+// Wine / Proton host.
+bool running_under_wine() { return host_is_wine(); }
+
 void init_once() {
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_inited) return;
@@ -591,7 +596,10 @@ void init_once() {
     g_lto = config_get_bool("nvn", "gpl_lto", false);
     g_cold = config_get_bool("nvn", "gpl_cold", true);
     {
-        const std::string m = config_get_str("nvn", "gpl_upgrade", "whole");
+        std::string m = config_get_str("nvn", "gpl_upgrade", "auto");
+        const bool is_auto = m != "off" && m != "false" && m != "0" && m != "lto" && m != "whole";
+        if (is_auto) m = running_under_wine() ? "off" : "whole";
+        NXLOG_I(kTag, "gpl_upgrade %s (%s)", m.c_str(), is_auto ? (running_under_wine() ? "auto, Wine" : "auto, not Wine") : "set");
         g_up_mode = (m == "off" || m == "false" || m == "0") ? UpMode::Off : (m == "lto") ? UpMode::Lto : UpMode::Whole;
         g_retain = g_lto || g_up_mode == UpMode::Lto;
     }
@@ -755,6 +763,29 @@ void queue_exact_locked(const std::string& key, std::function<VkPipeline()> buil
 }
 }  // namespace
 
+bool gpl_frames_flowing() { return frames_flowing(); }
+
+// ---- the loading gate ([nvn] gpl_gate) ----------------------------------------------------------------------------------------
+// `state` (default): play vs loading is the replay's frame detector (replay_loading: light frames while the game stalls, or boot's light
+// run), latched once per submission by replay_begin_submit, so a stall inside a submission (a compile, a readback) cannot flip the later
+// draws of it, or of the next ones, to synchronous compiles. `time`: the old rule, a present seen in the last 100 ms (frames_flowing), read
+// at every draw. Render thread only (the latch and every reader: gpl_link, graphics_pipeline, do_dispatch).
+namespace {
+bool g_play_latched = false;                   // false until the first submission: boot counts as loading
+bool gate_is_state() {
+    static const bool st = [] {
+        const std::string v = config_get_str("nvn", "gpl_gate", "state");
+        const bool s = v != "time";
+        NXLOG_I(kTag, "loading gate: %s ([nvn] gpl_gate = %s)", s ? "frame detector, latched per submission" : "a present in the last 100 ms", v.c_str());
+        return s;
+    }();
+    return st;
+}
+}  // namespace
+
+void gpl_latch_play(bool play) { g_play_latched = play; }
+bool gpl_gate_open() { return gate_is_state() ? g_play_latched : frames_flowing(); }
+
 VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::shared_ptr<PipeUpgrade>* up, bool* pending) {
     if (pending) *pending = false;
     if (!gpl_active()) return VK_NULL_HANDLE;
@@ -771,15 +802,30 @@ VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::share
     learn_raster(r);
     if (const std::vector<SpvIntSlot> ints = key_int_slots(key); !ints.empty()) g_pred_signed.store(ints[0].is_signed, std::memory_order_relaxed);
     static const bool async = config_get_bool("nvn", "gpl_async", true);
-    if (async && pending && frames_flowing()) {
-        const std::string pk = pre_key(sm, layout, r), fk = fs_key(sm, layout);
+    if (async && pending && gpl_gate_open()) {
+        // In play no part is built or waited for here (no pipe.lib / pipe.libwait on the render thread): when any of the four is not done
+        // (absent, or being built by another thread), the missing ones go first in line and the draw is deferred. A part that is done never
+        // goes back, so when all four are done here the get_part calls below take them without waiting.
+        const std::string pk = pre_key(sm, layout, r), fk = fs_key(sm, layout), vik = vi_key(key), fok = fo_key(key);
         std::lock_guard<std::mutex> lk(g_mu);
-        if (!g_stop && !(part_done_locked(pk) && part_done_locked(fk))) {
+        if (!g_stop && !(part_done_locked(pk) && part_done_locked(fk) && part_done_locked(vik) && part_done_locked(fok))) {
             const ProgLayout* pl = &layout;               // layouts live as long as the back end
             const StageModules m = sm;
-            if (!part_done_locked(pk)) queue_exact_locked(pk, [m, pl, r] { return build_pre(m.m[0], m.m[2], *pl, r); });
-            if (!part_done_locked(fk)) queue_exact_locked(fk, [m, pl] { return build_fs(m.m[1], *pl); });
+            uint32_t missing = 0;
+            bool in_flight = false;                       // a part some thread is building: the old path waited for it (pipe.libwait)
+            auto want = [&](const std::string& k, std::function<VkPipeline()> build) {
+                if (part_done_locked(k)) return;
+                ++missing;
+                in_flight = in_flight || g_libs.count(k) != 0;
+                queue_exact_locked(k, std::move(build));  // no-op when it is being built or queued already
+            };
+            want(pk, [m, pl, r] { return build_pre(m.m[0], m.m[2], *pl, r); });
+            want(fk, [m, pl] { return build_fs(m.m[1], *pl); });
+            want(vik, [key] { return build_vi(key); });
+            want(fok, [key] { return build_fo(key); });
             ++g_stats.draws_deferred;
+            if (in_flight) ++g_stats.draws_deferred_in_flight;
+            ft::mark("gpl.defer.part", missing);
             *pending = true;
             return VK_NULL_HANDLE;
         }
@@ -924,9 +970,9 @@ void gpl_take_upgrade(VkPipeline& current, VkPipeline& alt, std::shared_ptr<Pipe
         if (config_get_int("nvn", "gpl_ab", 0) > 0) {
             alt = fresh;                           // measurement: keep both and let gpl_ab_whole pick
         } else {
-            const VkPipeline old = current;
+            const VkPipeline old = current;          // null for an entry whose draws were skipped until now ([nvn] async_whole)
             current = fresh;
-            defer_destroy([old] { vkDestroyPipeline(vkdev(), old, nullptr); });      // the frame being recorded may have bound it
+            if (old) defer_destroy([old] { vkDestroyPipeline(vkdev(), old, nullptr); });      // the frame being recorded may have bound it
         }
         std::lock_guard<std::mutex> lk(g_mu);
         ++g_stats.upgrades_taken;
@@ -952,11 +998,11 @@ void gpl_progress_log() {
             static_cast<unsigned long long>(s.upgrades_queued), static_cast<unsigned long long>(s.upgrades_done), s.upgrade_ms, static_cast<unsigned long long>(s.upgrades_taken),
             static_cast<unsigned long long>(s.upgrades_failed));
     NXLOG_I(kTag, "libraries ahead: programs set %llu (covered by the key file %llu, new %llu), bound %llu (new %llu); jobs queued %llu, run %llu, "
-                  "no layout %llu, no modules %llu; draws deferred %llu for %llu parts; single-stage programs %llu; key-file keys queued %llu, run %llu",
+                  "no layout %llu, no modules %llu; draws deferred %llu (%llu with a part in progress) for %llu parts; single-stage programs %llu; key-file keys queued %llu, run %llu",
             static_cast<unsigned long long>(s.prog_set), static_cast<unsigned long long>(s.prog_covered), static_cast<unsigned long long>(s.prog_new),
             static_cast<unsigned long long>(s.prog_bound), static_cast<unsigned long long>(s.prog_bound_new), static_cast<unsigned long long>(s.jobs),
             static_cast<unsigned long long>(s.jobs_run), static_cast<unsigned long long>(s.jobs_no_layout), static_cast<unsigned long long>(s.jobs_no_modules),
-            static_cast<unsigned long long>(s.draws_deferred), static_cast<unsigned long long>(s.parts_async), static_cast<unsigned long long>(s.prog_single),
+            static_cast<unsigned long long>(s.draws_deferred), static_cast<unsigned long long>(s.draws_deferred_in_flight), static_cast<unsigned long long>(s.parts_async), static_cast<unsigned long long>(s.prog_single),
             static_cast<unsigned long long>(s.prebuild_jobs), static_cast<unsigned long long>(s.prebuild_run));
 }
 

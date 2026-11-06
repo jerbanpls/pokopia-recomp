@@ -131,14 +131,15 @@ bool NisSpatial::supports(VkExtent2D in_view, VkExtent2D out) const {
 }
 
 VkImageView NisSpatial::upscale(VkCommandBuffer cb, VkImageView src, VkExtent2D in_view, VkExtent2D in_tex, VkExtent2D out, bool linear_hdr, float prescale,
-                                float sharpness) {
+                                float sharpness, VkExtent2D out_tex) {
     if (!dev_ || !src || !supports(in_view, out)) return VK_NULL_HANDLE;
+    const VkExtent2D res{std::max(out.width, out_tex.width), std::max(out.height, out_tex.height)};   // the image; the scaler writes the out viewport only
     NISConfig cfg = {};
     if (!NVScalerUpdateConfig(cfg, std::clamp(sharpness, 0.0f, 1.0f), 0, 0, in_view.width, in_view.height, in_tex.width, in_tex.height, 0, 0, out.width,
-                              out.height, out.width, out.height, NISHDRMode::None))
+                              out.height, res.width, res.height, NISHDRMode::None))
         return VK_NULL_HANDLE;
     cfg.reserved0 = linear_hdr ? (prescale > 0.0f ? prescale : 1.0f) : 0.0f;   // the shader's kPrescale (0: [0,1] input used as is)
-    if (!img_ || extent_.width != out.width || extent_.height != out.height) {
+    if (!img_ || extent_.width != res.width || extent_.height != res.height) {
         if (img_) {
             dev_->wait_idle();
             dev_->destroy_image(img_);
@@ -146,9 +147,9 @@ VkImageView NisSpatial::upscale(VkCommandBuffer cb, VkImageView src, VkExtent2D 
         }
         gfx::ImageDesc id;
         id.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-        id.width = out.width;
-        id.height = out.height;
-        id.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        id.width = res.width;
+        id.height = res.height;
+        id.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         id.name = "nis out";
         std::string why;
         if (dev_->create_image(id, &img_, &why) != VK_SUCCESS) {
@@ -156,13 +157,21 @@ VkImageView NisSpatial::upscale(VkCommandBuffer cb, VkImageView src, VkExtent2D 
             img_ = gfx::Image();
             return VK_NULL_HANDLE;
         }
-        extent_ = out;
+        extent_ = res;
         img_init_ = false;
     }
+    const bool fresh = !img_init_;
     to_general(cb, img_.image, img_init_ ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                VK_ACCESS_2_SHADER_WRITE_BIT);
     img_init_ = true;
+    if (fresh && (res.width > out.width || res.height > out.height)) {   // a result image larger than out: zero it once (the draw that samples it may touch the texel past out; no NaN from undefined memory)
+        const VkClearColorValue zero{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, img_.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+        to_general(cb, img_.image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_WRITE_BIT);
+    }
 
     VkDescriptorSet set = sets_[next_];
     next_ = (next_ + 1) % kSetRing;

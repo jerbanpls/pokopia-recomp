@@ -1,11 +1,11 @@
-# Syntax-check (no code generation, no link) sources of the launcher (apps/launcher) or its tests (tests/launcher) with the include paths of this worktree.
+# Syntax-check (no code generation, no link) sources of the launcher (apps/launcher) with the include paths of this worktree.
 #   pwsh scripts\launcher_syntax.ps1 apps\launcher\keymap_win.cpp [more.cpp ...]
 # Exit code 0 = every file compiles. Uses the SDL headers of game-build\build\play (override with -Build).
 param([Parameter(Mandatory, Position = 0, ValueFromRemainingArguments)][string[]]$Files, [string]$Build = "")
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "proj.ps1")
 if (-not $Build) { $Build = Join-Path $proj "game-build\build\play" }
-$inc = "/I`"$root\include`" /I`"$root\src\gfx`" /I`"$root\apps\launcher`" /I`"$root\tests`" /I`"$Build\_deps\sdl3-src\include`" /I`"$recomp`""
+$inc = "/I`"$root\include`" /I`"$root\src\gfx`" /I`"$root\apps\launcher`" /I`"$Build\_deps\sdl3-src\include`" /I`"$recomp`""
 $env_cmd = Join-Path $PSScriptRoot "env.cmd"
 $rc = 0
 foreach ($f in $Files) {

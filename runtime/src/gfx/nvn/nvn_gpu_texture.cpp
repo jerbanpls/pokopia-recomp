@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "nxrt/config.h"
+#include "nxrt/frame_limiter.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gfx_tuning.h"
 #include "nxrt/gauge.h"
@@ -93,6 +94,17 @@ struct TexGpu {
     // write. A new image (creation, rescale, feedback loop usage) gets new numbers for every level.
     uint64_t wgen[kGenLevels] = {};
     bool fb_loop_tried = false;                         // tex_enable_feedback_loop ran (once per image)
+    bool read_back = false;                             // download_texture copied it into game memory (the CPU reads it): a dispatch that writes
+                                                        // it is never skipped ([nvn] async_compute). Render thread (set in download_texture's job)
+    // [nvn] readback_async (download_texture). rb: the readback buffer, laid out like the linear image (tegra::Layout offsets), grown to
+    // the largest request and never shrunk; freed with the image (tex_destroy). rb_gen[level]: the write generation the level had when the
+    // storage last got it (read after the layout restore, which counts as a write); rb_have[level][layer]: the storage holds that layer
+    // of it. Both render thread only (the dedupe runs in queue order there). rb_mu: held by a reading thread from the queueing to the
+    // tiling, so two guest threads reading the image do not interleave.
+    std::mutex rb_mu;
+    gfx::Buffer rb;
+    std::vector<uint64_t> rb_gen;
+    std::vector<std::vector<uint8_t>> rb_have;
 };
 
 // A virtual-pool texture too big to back fully (Mario Kart World's terrain virtual texture caches: 8192x8192 arrays of 68 layers, 1.4 to
@@ -1674,7 +1686,7 @@ bool gpu_untile_impl(Texture* t, TexGpu& g, Frame& f, const char** why) {
     // the GOBs of every block row, whole blocks: what the shader may read
     const uint64_t tiled = static_cast<uint64_t>((lv.blocks_y + 8 * lv.gob_blocks_y - 1) / (8 * lv.gob_blocks_y)) * gobs_x * lv.gob_blocks_y * 512;
     if (tiled > t->storage_size) return *why = "storage size", false;
-    const BufRef br = resolve_buffer(reinterpret_cast<uint64_t>(t->mem), tiled);
+    const BufRef br = [&] { PoolReasonScope pr_(kReasonUntile); return resolve_buffer(reinterpret_cast<uint64_t>(t->mem), tiled); }();
     if (!br.ok) return *why = "not in a pool", false;
     if (!untiler_init()) return false;
     Untiler& u = g_untile;
@@ -2438,6 +2450,7 @@ void tex_destroy(TexGpu* g) {
     g->views.clear();
     if (g->img) g_live_images.fetch_sub(1);
     device().destroy_image(g->img);
+    if (g->rb) device().destroy_buffer(g->rb);   // download_texture's buffer: tex_destroy runs once the GPU is done with the image
     if (g->sparse) {
         for (VkDeviceMemory m : g->sparse->chunks) vkFreeMemory(vkdev(), m, nullptr);
         delete g->sparse;
@@ -2762,29 +2775,169 @@ void mark_texture_cpu_dirty(Texture* t) {
 void texture_bound(Texture* t) { texprep::on_bound(t); }
 void texture_registered(Texture* t) { texprep::on_registered(t); }
 
-// Copies every level of a render target back into the game's storage (block-linear, tiled with tegra::tile). Only when the GPU
-// image holds the newest data: it exists, it was written by the GPU (or uploaded) and the CPU did not write since. Pitch-linear,
-// transcoded, depth and format-fallback textures are not read back.
-bool download_texture(Texture* t) {
-    if (!t || !active() || !t->mem || !t->fmt || !t->block_linear) return false;
-    TexGpu* g = t->gpu;
-    if (!g || g->failed || g->depth || g->transcoded || g->sparse || g->format != t->fmt->vk) return false;
-    if (g->scale != 1.0f) {
-        static int logged = 0;
-        if (logged++ < 10) NXLOG_W(kTag, "texture %u: a scaled render target is not read back into game memory", t->id);
-        return false;
-    }
-    if (t->cpu_dirty.load()) return false;
-    if (!(g->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || g->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
-    const TexLayout L = compute_texture_layout(t->b);
-    if (!L.valid || !L.block_linear) return false;
-    const uint64_t size = L.layout.linear_size;
+// ---- readback (download_texture) ------------------------------------------------------------------------------------------------
+// The game reads a render target on the CPU (nvnTextureReadTexels, nvnTextureInvalidateTexels; Pokopia about once a second from its
+// worker threads). The old path drained the GPU twice on the render thread for it (finish(), then a submission waited for on the GPU:
+// ~65 ms a read on the Deck, 38 % of its in-world spikes). [nvn] readback_async: the render thread records the copy in queue order and
+// goes on; the reading thread waits for the GPU, then tiles the levels it asked for into the storage. A level whose write generation did
+// not move since the storage last got it is not copied again.
+namespace {
+struct RbConfig {
+    bool async = true;          // [nvn] readback_async
+    int64_t grace_ms = -1;      // [nvn] readback_grace_ms (-1 auto: one frame at the limiter's target, 33 ms when unknown)
+    bool check = false;         // [nvn] readback_check
+};
+const RbConfig& rb_config() {
+    static const RbConfig c = [] {
+        RbConfig r;
+        r.async = nxrt::config_get_bool("nvn", "readback_async", true);
+        r.grace_ms = nxrt::config_get_int("nvn", "readback_grace_ms", -1);
+        r.check = nxrt::config_get_bool("nvn", "readback_check", false);
+        NXLOG_I(kTag, "readback: async %s, grace %s ms, check %s", r.async ? "on" : "off",
+                r.grace_ms < 0 ? "auto" : std::to_string(r.grace_ms).c_str(), r.check ? "on" : "off");
+        return r;
+    }();
+    return c;
+}
 
+std::atomic<uint64_t> g_rb_copies{0}, g_rb_skipped{0}, g_rb_calls{0};
+
+uint64_t rb_grace_ns() {
+    const int64_t ms = rb_config().grace_ms;
+    if (ms >= 0) return static_cast<uint64_t>(ms) * 1000000ull;
+    const FrameLimiter* lim = limiter();
+    const double fps = lim ? lim->target_fps() : 0.0;
+    return fps > 0.0 ? static_cast<uint64_t>(1e9 / fps) : 33000000ull;
+}
+
+uint32_t crc32_update(uint32_t crc, const uint8_t* p, size_t n) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t v = i;
+            for (int k = 0; k < 8; ++k) v = (v & 1) ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            t[i] = v;
+        }
+        return t;
+    }();
+    crc = ~crc;
+    for (size_t i = 0; i < n; ++i) crc = table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
+    return ~crc;
+}
+
+// [nvn] readback_check: the CRC-32 of what the storage holds of each level asked for (untiled, the layers asked for in order), the same
+// on both paths, so readback_async true and false can be compared run against run.
+void rb_log_crc(Texture* t, const TexLayout& L, uint32_t l0, uint32_t nl, uint32_t y0, uint32_t ny) {
+    for (uint32_t l = l0; l < l0 + nl; ++l) {
+        const tegra::LevelLayout& lv = L.layout.levels[l];
+        std::vector<uint8_t> lin(static_cast<size_t>(lv.linear_slice_size), 0);
+        uint32_t crc = 0;
+        for (uint32_t y = y0; y < y0 + ny; ++y) {
+            tegra::untile_level(L.desc, lv, t->mem + y * L.layout.tiled_layer_stride + lv.tiled_offset, lin.data());
+            crc = crc32_update(crc, lin.data(), lin.size());
+        }
+        NXLOG_I(kTag, "readback: texture %u level %u crc32 %08x", t->id, l, crc);
+    }
+}
+
+// One line for each of the first 20 textures read back: what is read, from which thread, and what was done.
+void rb_note(Texture* t, const TexGpu& g, const TexLayout& L, uint32_t l0, uint32_t nl, uint32_t y0, uint32_t ny, const char* what) {
+    static std::mutex mu;
+    static std::set<uint32_t> seen;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (seen.size() >= 20 || !seen.insert(t->id).second) return;
+    }
+    const char* thr = nxrt::log_thread_name();
+    NXLOG_I(kTag, "readback: texture %u (%s %ux%ux%u, %u levels, %u layers), thread %s: level %u+%u, layer %u+%u: %s", t->id,
+            g.fmt ? g.fmt->name : "?", g.base.width, g.base.height, g.base.depth, L.levels, L.layers, (thr && *thr) ? thr : "?", l0, nl, y0, ny,
+            what);
+}
+
+// The render thread's half of an async readback (rb.record), in queue order: after every submission queued before it, so the write
+// generations it compares are those the image has once those ran. Nothing is waited for here.
+struct RbJob {
+    bool skipped = false;       // every level and layer asked for is in the storage already: nothing recorded
+    bool copied = false;        // the copy is recorded into rb; false with skipped false: nothing to read (no buffer, image changed)
+};
+void rb_record(Frame& f, Texture* t, TexGpu* g, const TexLayout& L, uint32_t l0, uint32_t nl, uint32_t y0, uint32_t ny, RbJob& job) {
+    NXFT("rb.record");
+    if (t->gpu != g || g->failed || g->layout == VK_IMAGE_LAYOUT_UNDEFINED || g->scale != 1.0f || l0 + nl > g->levels || y0 + ny > g->layers)
+        return;   // the image went or changed after the caller looked
+    if (g->rb_gen.size() != g->levels) {
+        g->rb_gen.assign(g->levels, 0);
+        g->rb_have.assign(g->levels, std::vector<uint8_t>(g->layers, 0));
+    }
+    auto gen = [g](uint32_t l) { return g->wgen[std::min(l, kGenLevels - 1)]; };
+    bool have = true;
+    for (uint32_t l = l0; l < l0 + nl && have; ++l) {
+        if (g->rb_gen[l] != gen(l)) have = false;
+        for (uint32_t y = y0; y < y0 + ny && have; ++y) have = g->rb_have[l][y] != 0;
+    }
+    if (have) {
+        job.skipped = true;
+        return;
+    }
+    uint64_t need = 0;
+    for (uint32_t l = l0; l < l0 + nl; ++l) {
+        const tegra::LevelLayout& lv = L.layout.levels[l];
+        need = std::max<uint64_t>(need, lv.linear_offset + static_cast<uint64_t>(y0 + ny) * lv.linear_slice_size);
+    }
+    if (g->rb.size < need) {
+        gfx::Buffer nb;
+        if (device().create_buffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &nb, "nvn texture readback") != VK_SUCCESS)
+            return;
+        if (g->rb) {
+            gfx::Buffer old = g->rb;
+            defer_destroy([old]() mutable { device().destroy_buffer(old); });
+        }
+        g->rb = nb;
+    }
+    std::vector<uint64_t> before(g->levels);
+    for (uint32_t l = 0; l < g->levels; ++l) before[l] = gen(l);
+    const VkImageLayout prev = g->layout;
+    move_layout(f, *g, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    std::vector<VkBufferImageCopy> regions;
+    for (uint32_t l = l0; l < l0 + nl; ++l) {
+        const tegra::LevelLayout& lv = L.layout.levels[l];
+        VkBufferImageCopy r = {};
+        r.bufferOffset = lv.linear_offset + static_cast<uint64_t>(y0) * lv.linear_slice_size;   // where a whole-image copy puts it
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, y0, ny};
+        r.imageExtent = {lv.width, lv.height, lv.depth};
+        regions.push_back(r);
+    }
+    vkCmdCopyImageToBuffer(f.cb, g->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g->rb.buffer, static_cast<uint32_t>(regions.size()),
+                           regions.data());
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(f.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    move_layout(f, *g, prev);
+    // The generations after the restore: moving back to a writable layout bumps every level, though nothing wrote. The levels asked for
+    // take the new numbers; a level the storage was current for before stays current (only the restore moved its number).
+    for (uint32_t l = 0; l < g->levels; ++l) {
+        const bool current = g->rb_gen[l] == before[l];
+        if (l >= l0 && l < l0 + nl) {
+            if (!current) std::fill(g->rb_have[l].begin(), g->rb_have[l].end(), uint8_t{0});
+            for (uint32_t y = y0; y < y0 + ny; ++y) g->rb_have[l][y] = 1;
+            g->rb_gen[l] = gen(l);
+        } else if (current) {
+            g->rb_gen[l] = gen(l);
+        }
+    }
+    job.copied = true;
+}
+
+// readback_async = false (and calls on the render thread): the old path. Every level, earlier submissions drained first (finish), the
+// copy waited for on the render thread (run_frame_sync), the whole storage tiled again.
+bool download_all_levels_sync(Texture* t, TexGpu* g, const TexLayout& L) {
+    const uint64_t size = L.layout.linear_size;
     finish();   // earlier submissions must be done before the copy reads the image
     gfx::Buffer rb;
     run_frame_sync([&](Frame& f) {
         if (device().create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gfx::MemoryUse::Readback, &rb, "nvn texture readback") != VK_SUCCESS)
             return;
+        g->read_back = true;
         const VkImageLayout prev = g->layout;
         move_layout(f, *g, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         std::vector<VkBufferImageCopy> regions;
@@ -2806,6 +2959,81 @@ bool download_texture(Texture* t) {
     std::memcpy(lin.data(), rb.mapped, static_cast<size_t>(size));
     device().destroy_buffer(rb);
     tegra::tile(L.desc, L.layout, lin.data(), t->mem);
+    return true;
+}
+}  // namespace
+
+ReadbackStats readback_stats() {
+    ReadbackStats s;
+    s.copies = g_rb_copies.load();
+    s.skipped = g_rb_skipped.load();
+    s.calls = g_rb_calls.load();
+    return s;
+}
+
+// Copies levels of a render target back and tiles them into the game's storage (block-linear). Only when the GPU image holds the newest
+// data: it exists, it was written by the GPU (or uploaded) and the CPU did not write since. Pitch-linear, transcoded, depth and
+// format-fallback textures are not read back.
+bool download_texture(Texture* t, uint32_t level_first, uint32_t level_count, uint32_t layer_first, uint32_t layer_count) {
+    if (!t || !active() || !t->mem || !t->fmt || !t->block_linear) return false;
+    TexGpu* g = t->gpu;
+    if (!g || g->failed || g->depth || g->transcoded || g->sparse || g->format != t->fmt->vk) return false;
+    if (g->scale != 1.0f) {
+        static int logged = 0;
+        if (logged++ < 10) NXLOG_W(kTag, "texture %u: a scaled render target is not read back into game memory", t->id);
+        return false;
+    }
+    if (t->cpu_dirty.load()) return false;
+    if (!(g->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || g->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+    const TexLayout L = compute_texture_layout(t->b);
+    if (!L.valid || !L.block_linear) return false;
+    if (level_first >= L.levels || layer_first >= L.layers) return false;
+    const uint32_t l0 = level_first, nl = std::min(level_count, L.levels - level_first);
+    const uint32_t y0 = layer_first, ny = std::min(layer_count, L.layers - layer_first);
+    g_rb_calls.fetch_add(1);
+    const RbConfig& cfg = rb_config();
+
+    if (!cfg.async || on_render_thread()) {
+        if (!download_all_levels_sync(t, g, L)) return false;
+        g_rb_copies.fetch_add(1);
+        rb_note(t, *g, L, l0, nl, y0, ny, "copied every level (GPU drained)");
+        if (cfg.check) rb_log_crc(t, L, l0, nl, y0, ny);
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lk(g->rb_mu);
+    RbJob job;
+    uint64_t serial = 0;
+    {
+        NXFT("rb.queue");   // until the render thread has recorded it (the queue ahead of it is replayed first)
+        serial = queue_record([&](Frame& f) { rb_record(f, t, g, L, l0, nl, y0, ny, job); });
+    }
+    if (job.skipped) {
+        g_rb_skipped.fetch_add(1);
+        rb_note(t, *g, L, l0, nl, y0, ny, "skipped (not written since the last readback)");
+        if (cfg.check) rb_log_crc(t, L, l0, nl, y0, ny);
+        return true;   // the storage holds that data already
+    }
+    if (!job.copied) return false;   // no buffer, or the image changed: the storage is read as it is (as without a GPU image)
+    g_rb_copies.fetch_add(1);
+    {
+        NXFT("rb.wait");
+        wait_serial_grace(serial, rb_grace_ns());
+    }
+    if (device().device_lost()) return false;   // the copy never ran: the storage stays as it is
+    device().invalidate_buffer(g->rb);
+    {
+        NXFT("rb.tile");
+        const uint8_t* src = static_cast<const uint8_t*>(g->rb.mapped);
+        for (uint32_t l = l0; l < l0 + nl; ++l) {
+            const tegra::LevelLayout& lv = L.layout.levels[l];
+            for (uint32_t y = y0; y < y0 + ny; ++y)
+                tegra::tile_level(L.desc, lv, src + lv.linear_offset + static_cast<uint64_t>(y) * lv.linear_slice_size,
+                                  t->mem + y * L.layout.tiled_layer_stride + lv.tiled_offset);
+        }
+    }
+    rb_note(t, *g, L, l0, nl, y0, ny, "copied");
+    if (cfg.check) rb_log_crc(t, L, l0, nl, y0, ny);
     return true;
 }
 
@@ -2920,6 +3148,15 @@ void buffer_views_forget(VkBuffer buffer) {
         if (it->second) vkDestroyBufferView(vkdev(), it->second, nullptr);
         it = g_bufviews.erase(it);
     }
+}
+
+// Render thread. The image's flag, also through another texture object over the same storage; creates nothing.
+bool tex_was_read_back(Texture* t) {
+    if (!t) return false;
+    const TexGpu* g = t->gpu;
+    if (!g)
+        if (Ref<Texture> alias = texture_registry_find_alias(t)) g = alias->gpu;
+    return g && g->read_back;
 }
 
 }  // namespace gpu

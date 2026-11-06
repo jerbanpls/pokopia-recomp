@@ -14,14 +14,18 @@
 // while [display] dynamic_resolution is off. The scene passes keep viewports authored for 1920x1080: the command context's SetViewport(s)
 // (0x17b509c / 0x17b5240, which also derive the 2/w, -2/h screen constants from the rect) get the target's size, and the render thread's
 // replay (0x17b6c98) stretches what still arrives sized for 1920x1080. The internal size is fixed at start (the targets are created once).
-// The terrain occlusion pass's copy into its fixed 80x45 targets takes its source rect from a viewport recorded as 1920x1080 (hook_low_copy
-// below; without it a hard-edged dark patch showed on the ground). [pkp] render_override (default 1 since the
+// The terrain occlusion pass's copy into its fixed 80x45 targets takes its source rect from a viewport recorded as 1920x1080;
+// hook_record_viewports below gives that record the target's size (without the right source rect, a hard-edged dark patch showed on the
+// ground). [pkp] render_override (default 1 since the
 // 2026-11-02 run confirmed that fix; 0 = the game's 1080p layout) switches all of it on.
 //
 // Frame rate. The main loop's frame step (0xbfc404) turns the measured frame time into a frame multiplier in 60 Hz units that 90 functions
 // read (the float at 0x34c03f0): 1.0 within 1.5 ms of 1/60 s, else dt * 60 clamped to [1, 3]. Faster than 60 fps the multiplier stays 1
 // and the game runs fast. The mid hook at the join point (0xbfc4fc: s0 the multiplier, s8 the frame time) lets frames shorter than 1/60 s
-// count as dt * 60 (down to 1/8). At 60 fps and below nothing changes.
+// count as dt * 60 (down to 1/8). At 60 fps and below nothing changes. The area-transition scene sequence at 0x445994
+// adds that multiplier to its timer and originally fired only on exact equality (b.ne at 0x4459bc), so a fractional step could cross the
+// target and leave its iris wipe closed forever (#144). main.sites changes that branch to b.lo: the event fires on equality or a crossing,
+// while the timer and every other multiplier consumer keep their measured high-frame-rate steps.
 // The 60 fps cap is the game's own: the main loop's frame step (0x89def8, profiler zone "Sync") waits, sleeping in 200 us task-graph waits,
 // until tick frequency / 60 ticks (60 = 60 / 0x13fc00(), a constant 1.0) have passed since the previous frame began. The mid hook right
 // after that division (0x89e27c, x22 = the period in ticks) sets the period to 0, so the runtime's frame limiter at the frame boundary
@@ -56,11 +60,13 @@
 #include "pkp_movie_test.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "nxrt/config.h"
@@ -86,7 +92,7 @@ constexpr uint64_t kCopyParams = 0x22d1e0;                                  // d
 constexpr uint64_t kReplayViewports = 0x17b6c98;                            // mid: render-thread pass replay, before SetViewports
 constexpr uint64_t kSetViewport = 0x17b50ac, kSetViewports = 0x17b5254;     // mid: the command context's SetViewport (x1 rect) / SetViewports (w1 n, x2 rects)
 constexpr uint64_t kRecordViewports = 0x17c0420;                            // entry: records viewports into the pass state (x0 ctx + 0x10, w1 n, x2 rects)
-constexpr uint64_t kLowCopy = 0x73d824;                                    // mid: 0x73d73c calling the 80x45 copy 0x10f48d8 (x3 source texture, x5 source rect)
+constexpr uint64_t kCreateTarget = 0x1796810;                               // entry: KTGL 2D render-target create (w1 width, w2 height, w4 format)
 constexpr uint64_t kFrameMultiplier = 0xbfc4fc;                             // mid: s0 multiplier, s8 frame time
 constexpr uint64_t kSyncPeriod = 0x89e27c;                                  // mid: x22 the Sync wait's frame period in ticks (frequency / 60)
 constexpr uint64_t kFixedStepRate = 0x89e398;                               // mid: s0 60.0, x28 now, x25 previous frame tick, d8 tick frequency
@@ -100,7 +106,7 @@ constexpr int kFullLevel = 30;
 constexpr int kTableW = 1920, kTableH = 1080;
 
 // dynres manager layout: per view (stride 28) +16 target w/h, +24 largest scene w/h, +32 scene w/h, +40 levels (target, largest, current)
-constexpr size_t kViewStride = 28, kMaxW = 24, kMaxH = 28, kCurW = 32, kCurH = 36, kLvlMax = 41, kLvlCur = 42;
+constexpr size_t kViewStride = 28, kTgtW = 16, kTgtH = 20, kMaxW = 24, kMaxH = 28, kCurW = 32, kCurH = 36, kLvlMax = 41, kLvlCur = 42;
 
 // follow camera layout
 constexpr size_t kCamPlayer = 8, kCamPitch = 0xa0, kCamYaw = 0xa4, kCamPitchMax = 0xd4, kCamPitchMin = 0xd8, kCamManual = 0xff,
@@ -170,22 +176,75 @@ int hook_level_h(::Ctx* c, uint64_t, void*) {
 int hook_full_w(::Ctx* c, uint64_t, void*) { c->x[0] = static_cast<uint64_t>(st().w.load()); return 1; }
 int hook_full_h(::Ctx* c, uint64_t, void*) { c->x[0] = static_cast<uint64_t>(st().h.load()); return 1; }
 
+// [upscale] scene_scale (#116; extras::upscale_scene_scale: percent per side, or the temporal quality preset's) shrinks the scene viewport
+// (+32 / +36) the way the game's own dynamic resolution does: the scene passes render into the top-left of the full-size targets and the
+// composite pass (the tone-map draw, KTGL cbComposite: scene UV = uv * c5[11].zw + c5[11].xy) stretches that part over the frame with one
+// bilinear tap; the HUD and the post chain stay at full size. With dynamic resolution on, the game's own pick is capped at that size.
+// extras::scene_fraction tells the back end's scene upscalers (FSR 1 / NIS / FSR 3 / DLSS at the tone-map draw) which part to upscale. It is
+// published only with dynamic resolution off and one view: a size that changes every frame or a split screen keeps the game's own stretch.
+std::atomic<int> g_scene_pct{-1};   // the percent the last copy applied (logged when it changes)
+uint32_t scene_side(uint32_t full, int pct) { return std::max<uint32_t>(2, static_cast<uint32_t>((static_cast<uint64_t>(full) * pct + 50) / 100) & ~1u); }
+// The scene's part of its targets as the game will use it this frame (view 0's scene size / target size, per side; 1 = all of it), for the
+// viewport hooks below (#163). Unlike extras::scene_fraction it is also kept with dynamic resolution on; a split screen keeps 1.
+std::atomic<float> g_vp_kx{1.0f}, g_vp_ky{1.0f};
+
 int hook_copy_params(::Ctx* c, uint64_t, void*) {
     State& s = st();
-    if (s.dynres.load(std::memory_order_relaxed)) return 0;
+    const bool dyn = s.dynres.load(std::memory_order_relaxed);
+    const int pct = std::clamp(extras::upscale_scene_scale(), 25, 100);
+    if (g_scene_pct.exchange(pct, std::memory_order_relaxed) != pct)
+        NXLOG_I(kTag, "scene resolution %d%%: %ux%u of the %dx%d targets ([upscale] scene_scale%s)", pct, scene_side(s.w.load(), pct),
+                scene_side(s.h.load(), pct), s.w.load(), s.h.load(), dyn ? "; the cap of the game's dynamic resolution, upscaled by the game" : "");
     const uint64_t mgr = c->x[0];
-    if (!mgr || !mem::is_mapped(mgr, 16 + 2 * kViewStride)) return 0;
+    if (!mgr || !mem::is_mapped(mgr, 16 + 2 * kViewStride)) {
+        extras::scene_fraction_set(1.0f, 1.0f);
+        g_vp_kx.store(1.0f, std::memory_order_relaxed);
+        g_vp_ky.store(1.0f, std::memory_order_relaxed);
+        return 0;
+    }
     int views = 1;
     const uint64_t vo = rd<uint64_t>(s.base + kViewsGlobal);
     if (vo && mem::is_mapped(vo + 562, 1) && rd<uint8_t>(vo + 562)) views = 2;
+    // the viewport hooks' fraction: what view 0 renders after this copy (the game's own pick with dynamic resolution, capped below)
+    const auto publish_vp_fraction = [&] {
+        float kx = 1.0f, ky = 1.0f;
+        const uint32_t tw = rd<uint32_t>(mgr + kTgtW), th = rd<uint32_t>(mgr + kTgtH), cw = rd<uint32_t>(mgr + kCurW), ch = rd<uint32_t>(mgr + kCurH);
+        if (views == 1 && tw > 0 && th > 0 && cw > 0 && ch > 0 && cw <= tw && ch <= th) {
+            kx = static_cast<float>(cw) / static_cast<float>(tw);
+            ky = static_cast<float>(ch) / static_cast<float>(th);
+        }
+        g_vp_kx.store(kx, std::memory_order_relaxed);
+        g_vp_ky.store(ky, std::memory_order_relaxed);
+    };
+    if (dyn && pct >= 100) {
+        extras::scene_fraction_set(1.0f, 1.0f);
+        publish_vp_fraction();
+        return 0;
+    }
+    float fx = 1.0f, fy = 1.0f;
     for (int i = 0; i < views; ++i) {
         const uint64_t v = mgr + i * kViewStride;
-        wr<uint32_t>(v + kCurW, rd<uint32_t>(v + kMaxW));
-        wr<uint32_t>(v + kCurH, rd<uint32_t>(v + kMaxH));
+        const uint32_t mw = rd<uint32_t>(v + kMaxW), mh = rd<uint32_t>(v + kMaxH);
+        const uint32_t sw = pct >= 100 ? mw : scene_side(mw, pct), sh = pct >= 100 ? mh : scene_side(mh, pct);
+        if (dyn) {
+            wr<uint32_t>(v + kCurW, std::min(rd<uint32_t>(v + kCurW), sw));
+            wr<uint32_t>(v + kCurH, std::min(rd<uint32_t>(v + kCurH), sh));
+            continue;
+        }
+        wr<uint32_t>(v + kCurW, sw);
+        wr<uint32_t>(v + kCurH, sh);
         wr<uint8_t>(v + kLvlCur, rd<uint8_t>(v + kLvlMax));
+        const uint32_t tw = rd<uint32_t>(v + kTgtW), th = rd<uint32_t>(v + kTgtH);   // the targets the scene is drawn into
+        if (i == 0 && tw > 0 && th > 0) {
+            fx = static_cast<float>(sw) / static_cast<float>(tw);
+            fy = static_cast<float>(sh) / static_cast<float>(th);
+        }
     }
+    if (dyn || views > 1) fx = fy = 1.0f;
+    extras::scene_fraction_set(fx, fy);
+    publish_vp_fraction();
     s.copy_calls.fetch_add(1, std::memory_order_relaxed);
-    return 0;                                       // the game's copy runs with the full size in place
+    return 0;                                       // the game's copy runs with the chosen size in place
 }
 
 // The scene passes store their viewports as authored for 1920x1080 (the render thread replays them; the targets themselves follow the new
@@ -204,7 +263,18 @@ int hook_copy_params(::Ctx* c, uint64_t, void*) {
 // albedo's alpha) showed the AO of the characters as dark blue silhouettes at 1.333x their screen position and moved the ground's
 // AO the same way (the mottled, world-fixed haze of upstream #17). The entry hook there fixes the rects the same way, before they are
 // recorded, so the constants, the replayed viewport and the terrain occlusion copy's source rect all follow.
-std::atomic<uint64_t> g_set_vp_fixes{0}, g_rec_vp_fixes{0};
+// A scene rendered below its targets' size ([upscale] scene_scale, a temporal upscaler's preset, dynamic resolution: g_vp_kx / ky) has
+// its viewports authored as that fraction of the 1920x1080 frame: 1440x810 at 75% (#163). On a 16:9 render size of 1920x1080 that is
+// the right rect; on any other render size it must become the same fraction of the target, 1440x900 on 1920x1200. Kept at 1440x810 on a
+// 16:10 target, the scene passes drew into a 16:9 part (an empty band below it in the composite) and the screen constants the
+// characters and objects are placed with disagreed with the terrain's: players sank into the ground, the #73 symptoms. So a rect at the
+// origin of the full authored size or of the scene's fraction of it is matched, nothing in between.
+// [pkp] scene_viewport_fix (default true) turns this on; false keeps the full-frame match only (the old behaviour).
+std::atomic<uint64_t> g_set_vp_fixes{0}, g_rec_vp_fixes{0}, g_frac_vp_fixes{0};
+std::atomic<bool> g_frac_vp_on{true};
+// [pkp] target_fix = all rounds a fractional target to whole pixels. Matching its authored viewport through the inverse ratio needs the
+// same rounding allowance (for example 480x270 -> 168x95 at 672x378 maps back to 480x271.43), in addition to the original 1 px tolerance.
+double viewport_tolerance(int table, int render) { return 1.0 + 0.5 * table / std::max(1, render); }
 void fix_rect(::Ctx* c, uint64_t rect, uint64_t ctx = 0) {
     State& s = st();
     const int W = s.w.load(std::memory_order_relaxed), H = s.h.load(std::memory_order_relaxed);
@@ -217,10 +287,25 @@ void fix_rect(::Ctx* c, uint64_t rect, uint64_t ctx = 0) {
     const int32_t tw = rd<int32_t>(tgt + 0x58), th = rd<int32_t>(tgt + 0x5c);
     int32_t* r = reinterpret_cast<int32_t*>(rect);
     if (r[2] != 0 || r[3] != 0 || tw <= 0 || th <= 0 || (r[0] == tw && r[1] == th)) return;
-    const double ew = static_cast<double>(tw) * kTableW / W, eh = static_cast<double>(th) * kTableH / H;
-    if (std::fabs(r[0] - ew) > 1.0 || std::fabs(r[1] - eh) > 1.0) return;
-    r[0] = tw;
-    r[1] = th;
+    const double tolw = viewport_tolerance(kTableW, W), tolh = viewport_tolerance(kTableH, H);
+    const auto matches = [&](double kx, double ky) {
+        const double ew = static_cast<double>(tw) * kx * kTableW / W, eh = static_cast<double>(th) * ky * kTableH / H;
+        return std::fabs(r[0] - ew) <= tolw && std::fabs(r[1] - eh) <= tolh;
+    };
+    if (matches(1.0, 1.0)) {
+        r[0] = tw;
+        r[1] = th;
+        g_set_vp_fixes.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const double kx = g_vp_kx.load(std::memory_order_relaxed), ky = g_vp_ky.load(std::memory_order_relaxed);
+    if ((kx >= 1.0 && ky >= 1.0) || !g_frac_vp_on.load(std::memory_order_relaxed)) return;
+    const int32_t nw = static_cast<int32_t>(std::lround(tw * kx)), nh = static_cast<int32_t>(std::lround(th * ky));
+    if ((r[0] == nw && r[1] == nh) || !matches(kx, ky)) return;
+    if (g_frac_vp_fixes.fetch_add(1, std::memory_order_relaxed) == 0)
+        NXLOG_I(kTag, "scene viewport: %dx%d (%.3f x %.3f of the 1920x1080 frame) made %dx%d of the %dx%d target", r[0], r[1], kx, ky, nw, nh, tw, th);
+    r[0] = nw;
+    r[1] = nh;
     g_set_vp_fixes.fetch_add(1, std::memory_order_relaxed);
 }
 int hook_set_viewport(::Ctx* c, uint64_t, void*) {
@@ -261,7 +346,7 @@ int hook_replay_viewports(::Ctx* c, uint64_t, void*) {
         const int32_t* sc = reinterpret_cast<const int32_t*>(sp + 24 + 16 * i);
         if (vp[0] != 0.f || vp[1] != 0.f || sc[0] != 0 || sc[1] != 0 || sc[2] <= 0 || sc[3] <= 0) continue;
         const double ew = static_cast<double>(sc[2]) * kTableW / W, eh = static_cast<double>(sc[3]) * kTableH / H;
-        if (std::fabs(vp[2] - ew) <= 1.0 && std::fabs(vp[3] - eh) <= 1.0) {
+        if (std::fabs(vp[2] - ew) <= viewport_tolerance(kTableW, W) && std::fabs(vp[3] - eh) <= viewport_tolerance(kTableH, H)) {
             const uint64_t key = (static_cast<uint64_t>(sc[2]) << 32) | static_cast<uint32_t>(sc[3]);
             bool seen = false;
             const uint32_t nk = std::min<uint32_t>(s.vp_shape_n.load(std::memory_order_relaxed), 16);
@@ -281,31 +366,142 @@ int hook_replay_viewports(::Ctx* c, uint64_t, void*) {
     return 0;
 }
 
-// The terrain occlusion pass's 80x45 copy. At BeginScene_GBuffer, 0x73d73c copies the G-buffer colour and depth into the fixed 80x45 targets
-// (manager +0x40f0 / +0x40f8) that the terrain lighting (fs 37c9671c, t282.w) reads at screen UV. Through 0x10f48d8(dst, dst depth, dst
-// rect, src colour, src depth, src rect {x, y, w, h}), it gives the source rect as the current pass's recorded viewport (pass +96) times the
-// view's scale. 0x10edc40 records the G-buffer viewport through the light SetViewports 0x17c0420 as 1920 x 1080, and nothing changes that copy,
-// so on render-size G-buffer targets the copy samples UV 0..1920/W (1.5 at 1280x720, nvn.trace: a2[0..1.5]). The visible frame then lands in
-// the top-left of the 80x45 targets and the rest is the sampler's border; the terrain drawn on top is at the right place. The lighting
-// reads that mix, which puts a hard-edged dark patch on the ground. The mid hook on the call (0x73d824: x3 the source colour texture, u16
-// width / height at +48 / +50; x5 the source rect) turns a rect at the origin sized for 1920x1080 on a render-size source into the source's size.
-std::atomic<uint64_t> g_lowcopy_fixes{0};
-int hook_low_copy(::Ctx* c, uint64_t, void*) {
-    const State& s = st();
+// ---- render targets created at a literal size (#44) ----
+// 0x1796810 (x0 the device, w1 width, w2 height, w3 1, w4 format: 0 RGBA8, 5 D24S8, 107 R11G11B10F; w5, w6; it packs them and calls
+// 0x179e0a0) creates a KTGL 2D render target. The render-size targets come from the level getters above; a handful of call sites pass
+// their size as immediates instead, authored for the console's 1920x1080 frame. When such a target is drawn pixel for pixel against a
+// render-size one, the two disagree at any other size. The local-light buffer is the case seen (#44): the light volumes (vs a70f6d6e,
+// fs 1bc278d7) are drawn into it and read the G-buffer's depth (t381) and normals (t382) with texelFetch at gl_FragCoord, and the
+// deferred lighting (fs 0cd3176a, 37c9671c, f9b9b006) samples it at screen UV. On a W x H frame the light lit for pixel (x, y) showed
+// at (x W / 1920, y H / 1080): lamps, the PC terminal and the Pokemon Center door lamps glowed a second time below (16:10) or below and
+// right (1440p) of themselves, shaped like whatever lay there. The entry hook on the create gives each listed call site the size its
+// class says; the viewports those passes record as 1920x1080 (or a fraction of it) then follow through fix_rect, like every
+// render-size target.
+//
+// Every call site with a literal size was read (121 callers; the rest take a size from a variable). Return addresses (bl + 4):
+//   screen    follow the render size: the light set-up 0x10f41a8 (its object +0xb0 the local-light buffer, its twin +0xb8; +0x940 /
+//             +0x948 the per-view frame copies, filled by a blit whose rects come from both targets' own sizes, 0x10f57b8) and the
+//             snapshot 0x110d220 +0x170 (blitted from the frame the same way, 0x110dec0, and drawn back over a screen-size viewport).
+//   fraction  960x540 (+0x80 the half-size scene colour, +0x88 its depth: written by the downsamples c4664b38 / 2650d480 at UV, read by
+//             the transparent passes 096c2fdc, c0a3b861, fe074eda, 124d19d5, c01ba9e1 at UV) and 480x270 (+0x90, read by the deferred
+//             lighting at UV through c3[416]; +0x98, the depth written by e562487e at UV). Every reader and writer seen samples them at
+//             screen UV, so they are right at either size: they stay as authored unless [pkp] target_fix = all scales them by W/1920,
+//             H/1080 (sharper, untested in the world: a pass that set its viewport outside the three viewport hooks would cover a corner).
+//   fixed     left as authored: the photo pipeline (0x10fd8e0: 2 x 1920x1080 captures read back by the CPU with a 7680-byte pitch, see
+//             0x10fe828 / 0x10fffd4; 25 x 480x270, 2 x 320x180, 40 x 640x360 album images), the capture scratch 0x10fe140 (it scales the
+//             frame into a 1920x1080 target and draws into it with a viewport of 1920.0 x 1080.0 written straight into the command
+//             stream, which no viewport hook sees), the 240x135 thumbnails (0xb3b60, 0x110d220 +0x178), the 80x45 terrain occlusion
+//             and 30x16 targets (sampled at UV, small by design), and the square shadow / cube / LUT targets (not screen-shaped).
+// A 1920x1080 request from any other caller is logged once per caller and kept. [pkp] target_fix = off leaves every target as authored.
+enum class TargetClass : uint8_t { Screen, Fraction, Fixed };
+struct TargetSite {
+    uint32_t ret;          // return address of the call, offset in main
+    uint16_t w, h;         // the literal size it passes
+    TargetClass cls;
+    const char* what;
+};
+constexpr TargetSite kTargetSites[] = {
+    {0x10f4408, 1920, 1080, TargetClass::Screen, "local-light buffer"},
+    {0x10f4440, 1920, 1080, TargetClass::Screen, "local-light buffer twin"},
+    {0x10f4518, 1920, 1080, TargetClass::Screen, "frame copy, view 1"},
+    {0x10f4554, 1920, 1080, TargetClass::Screen, "frame copy, view 2"},
+    {0x110d330, 1920, 1080, TargetClass::Screen, "frame snapshot"},
+    {0x10f4204, 960, 540, TargetClass::Fraction, "half-size scene colour"},
+    {0x10f4228, 960, 540, TargetClass::Fraction, "half-size scene depth"},
+    {0x10f4320, 480, 270, TargetClass::Fraction, "quarter-size lighting input"},
+    {0x10f4358, 480, 270, TargetClass::Fraction, "quarter-size depth"},
+    {0x10fd930, 1920, 1080, TargetClass::Fixed, "photo capture"},
+    {0x10fd988, 1920, 1080, TargetClass::Fixed, "photo capture"},
+    {0x10fe210, 1920, 1080, TargetClass::Fixed, "capture scratch"},
+};
+constexpr size_t kTargetSiteCount = sizeof(kTargetSites) / sizeof(kTargetSites[0]);
+static_assert(kTargetSiteCount <= 32, "one log bit per site");
+
+enum class TargetFix : uint8_t { Off, Screen, All };
+std::atomic<uint8_t> g_target_fix{static_cast<uint8_t>(TargetFix::Screen)};
+std::atomic<uint32_t> g_target_logged{0};
+std::atomic<uint64_t> g_target_unlisted[128]{}; // every possible caller (121 total) can be remembered; an unlisted 1920x1080 create logs once
+
+TargetFix target_fix_from_config() {
+    std::string v = config_get_str("pkp", "target_fix", "screen");
+    for (char& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (v == "off" || v == "0" || v == "false" || v == "no") return TargetFix::Off;
+    if (v == "all") return TargetFix::All;
+    return TargetFix::Screen;                                        // screen, on, 1, true, and anything unknown
+}
+
+// true the first time `site` comes here; the table covers all 121 callers of the create function
+bool first_unlisted(uint64_t site) {
+    for (auto& slot : g_target_unlisted) {
+        uint64_t seen = slot.load(std::memory_order_relaxed);
+        if (seen == 0 && slot.compare_exchange_strong(seen, site + 1, std::memory_order_relaxed)) return true;
+        if (seen == site + 1) return false;
+    }
+    return true;
+}
+
+int hook_create_target(::Ctx* c, uint64_t, void*) {
+    State& s = st();
     const int W = s.w.load(std::memory_order_relaxed), H = s.h.load(std::memory_order_relaxed);
-    if (W == kTableW && H == kTableH) return 0;
-    const uint64_t src = c->x[3], rect = c->x[5];
-    if (!src || !rect || !mem::is_mapped(src + 48, 4)) return 0;
-    const int tw = rd<uint16_t>(src + 48), th = rd<uint16_t>(src + 50);
-    int32_t* r = reinterpret_cast<int32_t*>(rect);                   // {x, y, w, h}
-    if (r[0] != 0 || r[1] != 0 || tw <= 0 || th <= 0 || (r[2] == tw && r[3] == th)) return 0;
-    const double ew = static_cast<double>(tw) * kTableW / W, eh = static_cast<double>(th) * kTableH / H;
-    if (std::fabs(r[2] - ew) > 1.0 || std::fabs(r[3] - eh) > 1.0) return 0;
-    if (g_lowcopy_fixes.fetch_add(1, std::memory_order_relaxed) == 0)
-        NXLOG_I(kTag, "terrain occlusion copy: source rect %dx%d -> %dx%d", r[2], r[3], tw, th);
-    r[2] = tw;
-    r[3] = th;
+    if (W == kTableW && H == kTableH) return 0;                      // the console's frame: every target as authored
+    const auto mode = static_cast<TargetFix>(g_target_fix.load(std::memory_order_relaxed));
+    const uint32_t w = static_cast<uint32_t>(c->x[1]), h = static_cast<uint32_t>(c->x[2]);
+    const uint64_t site = c->x[30] - s.base;
+    size_t k = 0;
+    while (k < kTargetSiteCount && !(kTargetSites[k].ret == site && kTargetSites[k].w == w && kTargetSites[k].h == h)) ++k;
+    if (k == kTargetSiteCount) {
+        if (w == static_cast<uint32_t>(kTableW) && h == static_cast<uint32_t>(kTableH) && first_unlisted(site))
+            NXLOG_I(kTag, "render target: 1920x1080 kept (format %u, caller 0x%llx, not in the table)", static_cast<uint32_t>(c->x[4]),
+                    static_cast<unsigned long long>(site));
+        return 0;
+    }
+    const TargetSite& t = kTargetSites[k];
+    uint32_t nw = w, nh = h;
+    if (mode != TargetFix::Off && t.cls == TargetClass::Screen) {
+        nw = static_cast<uint32_t>(W);
+        nh = static_cast<uint32_t>(H);
+    } else if (mode == TargetFix::All && t.cls == TargetClass::Fraction) {
+        nw = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(static_cast<double>(w) * W / kTableW)));
+        nh = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(static_cast<double>(h) * H / kTableH)));
+    }
+    c->x[1] = nw;
+    c->x[2] = nh;
+    if (!(g_target_logged.fetch_or(1u << k, std::memory_order_relaxed) & (1u << k))) {
+        if (nw != w || nh != h)
+            NXLOG_I(kTag, "render target: %ux%u made %ux%u (%s, format %u, caller 0x%llx)", w, h, nw, nh, t.what,
+                    static_cast<uint32_t>(c->x[4]), static_cast<unsigned long long>(site));
+        else
+            NXLOG_I(kTag, "render target: %ux%u kept (%s, format %u, caller 0x%llx)", w, h, t.what, static_cast<uint32_t>(c->x[4]),
+                    static_cast<unsigned long long>(site));
+    }
     return 0;
+}
+
+// The hooks that make the game's screen-relative targets and their viewports follow the render size (both size paths below).
+// The terrain occlusion pass's 80x45 copy (0x73d73c calling 0x10f48d8) needs no hook of its own: it takes its source rect from the
+// G-buffer pass's recorded viewport (pass +96) times the view's scale, and hook_record_viewports makes that record the target's size.
+// Its former mid hook (0x73d824) never changed a rect in eight 2560x1440 runs with the recorder hook in place, though the copy ran
+// every frame (the 80x45 targets were drawn 140 times per traced frame).
+void install_render_size_hooks(uint64_t base) {
+    State& s = st();
+    const struct { uint64_t off; SiteHookFn fn; } table[] = {
+        {kLevelWidth, hook_level_w}, {kLevelHeight, hook_level_h}, {kFullWidth, hook_full_w}, {kFullHeight, hook_full_h},
+        {kCopyParams, hook_copy_params},
+    };
+    for (const auto& t : table) s.hooks.push_back(hook_add_entry(base + t.off, t.fn));
+    s.hooks.push_back(hook_add_mid(base + kSetViewport, &hook_set_viewport));
+    s.hooks.push_back(hook_add_mid(base + kSetViewports, &hook_set_viewports));
+    s.hooks.push_back(hook_add_entry(base + kRecordViewports, &hook_record_viewports));
+    s.hooks.push_back(hook_add_mid(base + kReplayViewports, &hook_replay_viewports));
+    g_frac_vp_on.store(config_get_bool("pkp", "scene_viewport_fix", true), std::memory_order_relaxed);
+    const TargetFix mode = target_fix_from_config();
+    g_target_fix.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
+    s.hooks.push_back(hook_add_entry(base + kCreateTarget, &hook_create_target));
+    if (s.w.load() != kTableW || s.h.load() != kTableH)
+        NXLOG_I(kTag, "render targets with a literal size: %s ([pkp] target_fix)",
+                mode == TargetFix::Off   ? "all kept as authored"
+                : mode == TargetFix::All ? "screen-size and fractional ones follow the render size"
+                                         : "screen-size ones follow the render size");
 }
 
 // ---- aspect ratio (ultrawide, 16:10) ----
@@ -665,16 +861,7 @@ void play_install_render(uint64_t base, const play::DisplaySettings& d, int wind
         game_target_memory(base, &gw, &gh);
         s.w.store(gw);
         s.h.store(gh);
-        const struct { uint64_t off; SiteHookFn fn; } table[] = {
-            {kLevelWidth, hook_level_w}, {kLevelHeight, hook_level_h}, {kFullWidth, hook_full_w}, {kFullHeight, hook_full_h},
-            {kCopyParams, hook_copy_params},
-        };
-        for (const auto& t : table) s.hooks.push_back(hook_add_entry(base + t.off, t.fn));
-        s.hooks.push_back(hook_add_mid(base + kSetViewport, &hook_set_viewport));
-        s.hooks.push_back(hook_add_mid(base + kSetViewports, &hook_set_viewports));
-        s.hooks.push_back(hook_add_entry(base + kRecordViewports, &hook_record_viewports));
-        s.hooks.push_back(hook_add_mid(base + kReplayViewports, &hook_replay_viewports));
-        s.hooks.push_back(hook_add_mid(base + kLowCopy, &hook_low_copy));
+        install_render_size_hooks(base);
         s.hooks.push_back(hook_add_mid(base + kCamSubmit, &hook_cam_submit));
         s.hooks.push_back(hook_add_mid(base + kProjBuild, &hook_proj_build));
         wd.ui_size = mem::alloc_kernel(16);
@@ -700,8 +887,8 @@ void play_install_render(uint64_t base, const play::DisplaySettings& d, int wind
     if (!override_size) {
         // The game's own size (the back end's [gfx] render_scale enlarges it). Its dynamic resolution still drops the scene viewport below
         // 1920x1080 when frames run late (1664x936 seen at 1440p: the scene then covers part of the targets, a hard-edged band): with
-        // [display] dynamic_resolution off, the per-frame copy of the parameters keeps the top level.
-        if (!d.dynamic_resolution) s.hooks.push_back(hook_add_entry(base + kCopyParams, hook_copy_params));
+        // [display] dynamic_resolution off, the per-frame copy of the parameters keeps the top level ([upscale] scene_scale below it).
+        s.hooks.push_back(hook_add_entry(base + kCopyParams, hook_copy_params));
         // [display] render_scale for the NVN back end, which renders the game's targets at that factor: a fixed size by its height, auto
         // by the window's height (at least 1), a percentage of the console's 1920x1080
         float scale = 1.0f;
@@ -718,16 +905,7 @@ void play_install_render(uint64_t base, const play::DisplaySettings& d, int wind
     game_target_memory(base, &w, &h);
     s.w.store(w);
     s.h.store(h);
-    const struct { uint64_t off; SiteHookFn fn; } table[] = {
-        {kLevelWidth, hook_level_w}, {kLevelHeight, hook_level_h}, {kFullWidth, hook_full_w}, {kFullHeight, hook_full_h},
-        {kCopyParams, hook_copy_params},
-    };
-    for (const auto& t : table) s.hooks.push_back(hook_add_entry(base + t.off, t.fn));
-    s.hooks.push_back(hook_add_mid(base + kSetViewport, &hook_set_viewport));
-    s.hooks.push_back(hook_add_mid(base + kSetViewports, &hook_set_viewports));
-    s.hooks.push_back(hook_add_entry(base + kRecordViewports, &hook_record_viewports));
-    s.hooks.push_back(hook_add_mid(base + kReplayViewports, &hook_replay_viewports));
-    s.hooks.push_back(hook_add_mid(base + kLowCopy, &hook_low_copy));
+    install_render_size_hooks(base);
     s.render_installed = true;
     NXLOG_I(kTag, "render resolution %dx%d (window %dx%d, scale %d%%%s%s), dynamic resolution %s", w, h, window_w, window_h, d.render_scale,
             d.render_width > 0 && d.render_height > 0 ? ", fixed size" : "", d.render_scale <= 0 && host_is_handheld() ? ", handheld: the window's size" : "",

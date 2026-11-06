@@ -30,7 +30,7 @@ Python is `tools\.venv\Scripts\python.exe` at the repository root (3.13; package
     python -m nxrecomp cover <module.nso|prog.elf> [--game mpr]      per-instruction-word translation coverage of .text
     python -m nxrecomp.funcs <module> --out functions.tsv             function boundaries and the evidence for each
 
-In a CMake build (the game, or an oracle), `cmake/NxRecomp.cmake` gives `nxrecomp_add_module(<target> INPUT <file> ...)`, which
+In a CMake build (the game), `cmake/NxRecomp.cmake` gives `nxrecomp_add_module(<target> INPUT <file> ...)`, which
 lifts as a build step and builds the result as a static library (flags: C++20, `-fno-strict-aliasing`, `-ffp-contract=off`,
 `-mcx16`, optnone for functions over `optnone_insns` instructions; `NX_USE_LAUNCHER` adds a time-limit fallback; `NX_SPIN_YIELD`
 passes `--spin-yield`). Presets:
@@ -49,18 +49,6 @@ passes `--spin-yield`). Presets:
   can neither hoist them nor drop the loop. `--spin-yield` (game config `spin_yield`) also calls `nx_spin_hint(2)` at each
   loop head. The lift log prints the counts per module.
 - `games/<name>/config.py` is the per-game seam (module list and bases, function overrides, extra entries, patches).
-
-## Oracles (pass/fail checks under `oracle/`, hash-locked in `oracle/SHA256SUMS`)
-
-| Oracle | Command (from `recomp/`) | What it proves |
-|---|---|---|
-| Differential test | `python oracle/difftest/difftest.py all` | every instruction shape of `corpus.json` (11,603 shapes of Cortex-A57 + LSE) gives identical registers, flags, TPIDR/FPCR and memory in Unicorn and in the lifted code, from random, integer-edge, colliding-operand and special-FP states: 565,061 of 565,061 tests |
-| Mutation test | `python oracle/difftest/mutation.py` | All 22 planted lifter bugs are reported as different, and the unmutated copy passes |
-| End to end | `python oracle/e2e/run_e2e.py` | 15 clang-built AArch64 programs (integers, switches, FP, NEON, crypto, LSE, exclusives incl. 128-bit, TLS, virtual calls, tail calls, C++ exceptions) lifted, built for x64 and run: every register and every writable byte equals Unicorn's |
-| Spin loops | `python oracle/spin/test_spin.py` | synthetic poll loops are found (and counters, cursors, calls, CAS retries are not), only their loads change, and at -O1 clang keeps the polled load inside the loop |
-| Site lists | `python oracle/hooks/test_hooks.py` | patches, inline callouts, function hooks and dynamic immediates behave and count correctly |
-| Known answers | `python oracle/ka/run_ka.py` | 108 cases of the rEden / dynarmic A64 tests (through ScarletNX), no emulator involved: 89 pass, 0 fail, 7 skipped, 6 need FPSR flags and 5 need FPCR (both documented gaps) |
-| Corpus | `python oracle/difftest/gen_corpus.py` | regenerates `corpus.json` (deterministic) |
 
 Lifting and compiling the game itself (`scripts\build_mpr.cmd`) is described in `docs/S1b.md`. Gaps that remain are listed with numbers in `docs/GAPS.md`. The S1 log is `docs/S1.md`, numbered bug notes are in
 `docs/debug/`.

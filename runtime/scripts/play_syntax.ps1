@@ -5,7 +5,7 @@ param([Parameter(Mandatory, Position = 0, ValueFromRemainingArguments)][string[]
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "proj.ps1")
 if (-not $Build) { $Build = Join-Path $proj "game-build\build\play" }
-$inc = "/I`"$root\include`" /I`"$root\src\gfx`" /I`"$root\src\gfx\nvn`" /I`"$root\src\gfx\nvn\third_party`" /I`"$root\src\services`" /I`"$root\src\testtools`" /I`"$root\tests`" " +
+$inc = "/I`"$root\include`" /I`"$root\src\gfx`" /I`"$root\src\gfx\nvn`" /I`"$root\src\gfx\nvn\third_party`" /I`"$root\src\services`" /I`"$root\src\testtools`" " +
        "/I`"$Build\_deps\sdl3-src\include`" /I`"$Build\_deps\imgui-src`" /I`"$Build\_deps\vulkan_headers-src\include`" /I`"$Build\_deps\volk-src`" /I`"$recomp`""
 $env_cmd = Join-Path $PSScriptRoot "env.cmd"
 $rc = 0

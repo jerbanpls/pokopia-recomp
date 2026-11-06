@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Gauges and the soak sampler (declared in nxrt/gauge.h).
 #include "nxrt/gauge.h"
+#include "host_probe.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -243,6 +244,7 @@ void monitor_run(double summary_s) {
                 if (prev) dt.push_back((double)(t - prev) * 1000.0 / qpc_freq());
                 prev = t;
             }
+            diag::host_probe_tick(n > 0);
             const uint64_t window_frames = n - last_n;
             last_n = n;
             if (n > 0) seen_frames = true;

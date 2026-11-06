@@ -21,6 +21,7 @@ fn main() {
     let job = shaders::Job {
         game_dir: PathBuf::from(&a[0]),
         romfs: PathBuf::from(&a[1]),
+        romfs_base: None,
         main: PathBuf::from(&a[2]),
         limit: a.get(4).and_then(|x| x.parse().ok()).unwrap_or(0),
         jobs: a.get(5).and_then(|x| x.parse().ok()).unwrap_or(2),

@@ -25,6 +25,8 @@ export async function render(el) {
   let visitAddr = mode === 'visit' ? server : mem.visitAddr || '';
   let visitCode = mode === 'visit' ? iniCode : mem.visitCode || '';
   let picked = mode;   // the radio selection; Visit is applied by its Save button
+  // [pkp] link_interact_everywhere (pkp_linkplay.cpp): every player of a session needs the same value, the game refuses the others
+  let interact = /^(1|true|yes|on)$/i.test((data.pkp['pkp.link_interact_everywhere'] || '').trim());
 
   async function loadLan() {
     try { lan = await api('lan_report'); } catch { lan = null; }
@@ -98,6 +100,10 @@ export async function render(el) {
         </div>
         ${picked === 'host' ? hostHtml() : ''}
         ${picked === 'visit' ? visitHtml() : ''}
+        ${picked !== 'alone' ? `<div class="card">
+          <label class="candidate"><input type="checkbox" id="interact" ${interact ? 'checked' : ''}><div><b>Interact everywhere (experimental)</b>
+            <div class="dim">Outside Palette Town the game puts everyone in Spectator Mode. This lets visitors use moves and items, pick up, place and build in the story areas too. Every player must turn it on, or they cannot join.</div></div></label>
+        </div>` : ''}
         ${picked !== 'alone' ? `<div class="banner info">${icon('info')}<div>
           In the game, open Link Play and pick <b>Local connection</b> (Online connection is Nintendo's service). Each player needs their own save: a copied save cannot join its original.${picked === 'host' ? ' Keep the launcher open while you host.' : ''} Changes apply the next time the game starts.</div></div>` : ''}
       </div>`;
@@ -180,6 +186,14 @@ export async function render(el) {
       draw();
     });
     el.querySelector('#v-save')?.addEventListener('click', saveVisit);
+    el.querySelector('#interact')?.addEventListener('change', async (ev) => {
+      const on = ev.target.checked;
+      try {
+        await write([{ file: 'pkp', section: 'pkp', key: 'link_interact_everywhere', value: on ? 'true' : 'false' }]);
+        interact = on;
+        toast(on ? 'Interact everywhere is on. Every player needs it on; it applies the next time the game starts.' : 'Interact everywhere is off.', 'ok');
+      } catch (e) { ev.target.checked = !on; toast(errText(e), 'error'); }
+    });
   }
 
   if (picked === 'host') await loadLan();

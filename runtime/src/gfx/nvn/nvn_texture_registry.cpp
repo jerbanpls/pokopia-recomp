@@ -170,6 +170,8 @@ bool texture_hash_virtual(const Texture& t, uint64_t& hash) {
 }
 
 void textures_cpu_wrote(const void* lo, uint64_t size) {
+    static const uint16_t zid = ft::zone_id("tex.cpu_wrote");
+    ft::Scope zs(zid);       // arg: textures hit
     const uint64_t a = reinterpret_cast<uint64_t>(lo), b = a + size;
     std::vector<Ref<Texture>> hit;
     {
@@ -208,6 +210,7 @@ void textures_cpu_wrote(const void* lo, uint64_t size) {
             else if (ts + (64ull << 20) < a) break;   // textures are far smaller than 64 MiB
         }
     }
+    zs.set_arg(static_cast<uint32_t>(hit.size()));
     for (auto& t : hit) {
         tx_mark("tx.flush", t.get());
         tev(t.get(), "cpu_wrote", reinterpret_cast<uint64_t>(lo), size);

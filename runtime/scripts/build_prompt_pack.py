@@ -7,6 +7,9 @@ Build (run from the prompts project root):
 Check an existing pack:
   python -I scripts/build_prompt_pack.py --verify assets/prompts/prompt_icons.pak
 
+Add the derived entries (the d-pad direction icons) to an existing pack without the Kenney pack; other entries are kept byte for byte:
+  python -I scripts/build_prompt_pack.py --derive assets/prompts/prompt_icons.pak
+
 Pack format, little endian:
   header (24 bytes): char magic[4]="MPIP", u32 version=1, u32 count, u32 icon_w=36, u32 icon_h=36, u32 reserved=0
   count directory entries (48 bytes each): char name[40] (ASCII, NUL padded), u32 offset, u32 size (=5184)
@@ -76,6 +79,13 @@ PS_MAP = {
     "ps/create": "playstation5_button_create",
     "ps/dpad": "playstation_dpad",
 }
+
+# One d-pad direction each, for prompts that name a direction (Pokopia's left/right/up/down glyphs): <style>/dpad_<dir>, drawn from the
+# whole cross <style>/dpad by dpad_direction(). Value: the dead centre the arms leave out, in pixels from the icon centre (the Xbox cross
+# is solid there; the PlayStation arms are four pieces split along the diagonals).
+DPAD_DIRS = ("up", "down", "left", "right")
+DPAD_CORE = {"xbox/dpad": 6.5, "ps/dpad": 0.0}
+DPAD_DIM = 0.4              # the arms not pressed: the cross's luminance x this (a grey cross), alpha kept
 
 # Mouse plus the last-resort generic key.
 OTHER_KBM_MAP = {
@@ -336,6 +346,60 @@ def pressed_variant(icon: Image.Image) -> Image.Image:
     return Image.merge("RGBA", (chan(1.0), chan(0.72), chan(0.18), a))
 
 
+def dpad_direction(cross: Image.Image, d: str, core: float) -> Image.Image:
+    """The whole d-pad cross with one arm left as it is and the rest dimmed to grey. A pixel is in the arm of `d` when it lies beyond the
+    diagonal through the centre of the drawn cross on that side and more than `core` from the centre along the arm."""
+    box = cross.getchannel("A").point(lambda v: 255 if v > 8 else 0).getbbox()
+    if box is None:
+        raise SystemExit("d-pad icon has no visible pixels")
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    src = cross.load()
+    out = cross.copy()
+    px = out.load()
+    for y in range(ICON):
+        for x in range(ICON):
+            dx, dy = x + 0.5 - cx, y + 0.5 - cy
+            along = {"up": -dy, "down": dy, "left": -dx, "right": dx}[d]
+            across = abs(dx) if d in ("up", "down") else abs(dy)
+            if along > across and along > core:
+                continue
+            r, g, b, a = src[x, y]
+            px[x, y] = (round(r * DPAD_DIM), round(g * DPAD_DIM), round(b * DPAD_DIM), a)
+    return out
+
+
+def add_dpad_directions(icons: dict[str, Image.Image]) -> list[str]:
+    """Adds <style>/dpad_<dir> for every whole cross in DPAD_CORE (no _pressed twins). Returns the added names."""
+    added = []
+    for cross, core in DPAD_CORE.items():
+        for d in DPAD_DIRS:
+            icons[f"{cross}_{d}"] = dpad_direction(icons[cross], d, core)
+            added.append(f"{cross}_{d}")
+    return added
+
+
+def read_pak(path: Path) -> dict[str, Image.Image]:
+    data = path.read_bytes()
+    magic, ver, count, w, h, _ = struct.unpack_from(HEADER_FMT, data, 0)
+    if magic != MAGIC or ver != VERSION or (w, h) != (ICON, ICON):
+        raise SystemExit(f"not an MPIP v{VERSION} {ICON}x{ICON} pack: {path}")
+    icons = {}
+    for i in range(count):
+        raw, off, size = struct.unpack_from(ENTRY_FMT, data, HEADER_SIZE + ENTRY_SIZE * i)
+        icons[raw.rstrip(b"\0").decode("ascii")] = Image.frombytes("RGBA", (ICON, ICON), data[off:off + size])
+    return icons
+
+
+def derive(path: Path) -> int:
+    icons = read_pak(path)
+    added = add_dpad_directions(icons)
+    for n in added:
+        icons[n + "_pressed"] = pressed_variant(icons[n])
+    size = write_pak(path, icons)
+    print(f"wrote {path} ({size} bytes), {len(icons)} entries; derived: {', '.join(added)} (+ _pressed)")
+    return 0
+
+
 _font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
 
 
@@ -503,6 +567,7 @@ def build(args: argparse.Namespace) -> int:
             icons[name] = fit_icon(load_src(root, PS_DIR, stem))
         for name, stem in OTHER_KBM_MAP.items():
             icons[name] = fit_icon(load_src(root, KBM_DIR, stem))
+        add_dpad_directions(icons)
 
         cap = load_src(root, KBM_DIR, "keyboard")
         baked: list[tuple[str, str]] = []
@@ -549,9 +614,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--preview", help="also write a contact-sheet PNG of all entries here")
     ap.add_argument("--font", default=str(DEFAULT_FONT), help="TTF used for baked key labels and the preview")
     ap.add_argument("--verify", metavar="PAK", help="check an existing pak and exit")
+    ap.add_argument("--derive", metavar="PAK", help="add the derived d-pad direction entries to an existing pak in place and exit")
     args = ap.parse_args(argv)
     if args.verify:
         return verify(Path(args.verify))
+    if args.derive:
+        return derive(Path(args.derive))
     if not args.kenney:
         ap.error("--kenney is required")
     return build(args)

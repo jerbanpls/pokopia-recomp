@@ -26,6 +26,7 @@ bool g_settings_set = false;
 std::atomic<int> g_upscale_mode{-1};          // -1: not read yet
 std::atomic<float> g_upscale_sharp{0.8f};
 std::atomic<int> g_scene_scale{100};
+std::atomic<float> g_scene_fx{1.0f}, g_scene_fy{1.0f};   // scene_fraction
 std::atomic<int> g_upscale_quality{static_cast<int>(UpscaleQuality::Quality)};
 std::atomic<float> g_pic_contrast{1.0f}, g_pic_saturation{1.0f}, g_pic_black{0.0f}, g_pic_gamma{1.0f};
 std::atomic<bool> g_pic_active{false};
@@ -160,6 +161,16 @@ int upscale_scene_scale() {
         if (pct > 0) return pct;
     }
     return g_scene_scale.load(std::memory_order_relaxed);
+}
+
+void scene_fraction_set(float fx, float fy) {
+    g_scene_fx.store(fx > 0.0f && fx < 1.0f ? fx : 1.0f, std::memory_order_relaxed);
+    g_scene_fy.store(fy > 0.0f && fy < 1.0f ? fy : 1.0f, std::memory_order_relaxed);
+}
+
+void scene_fraction(float* fx, float* fy) {
+    *fx = g_scene_fx.load(std::memory_order_relaxed);
+    *fy = g_scene_fy.load(std::memory_order_relaxed);
 }
 
 UpscaleQuality upscale_quality() {

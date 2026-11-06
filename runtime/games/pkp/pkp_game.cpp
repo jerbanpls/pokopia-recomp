@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Pokémon Pokopia: the whole game module as one nxrt::game::Info (pkp_game.h). Play-mode hooks come here as they are found.
 #include "pkp_game.h"
+#include "pkp_linkplay.h"
 #include "pkp_menu.h"
 #include "pkp_play.h"
 #include "pkp_quality.h"
@@ -8,6 +9,7 @@
 
 #include <cstring>
 
+#include "nxrt/config.h"
 #include "play_game.h"
 #include "play_types.h"
 
@@ -19,18 +21,24 @@ namespace {
 // that pumps window events and samples the pad/keyboard for play mode (needs `entryhook 0x7101fdcde4` in recomp/games/pkp/main.sites).
 constexpr uint64_t kFrameUpdate = 0x1fdcde4;
 
-// play mode's install / remove / status, plus the menu mouse (pkp_menu.cpp)
+// play mode's install / remove / status, plus the menu mouse (pkp_menu.cpp) and Link Play's Interact everywhere (pkp_linkplay.cpp)
 void install_all(uint64_t base, play::GameHost* host, const play::Settings& s) {
     play_install(base, host, s);
     menu_install(base);
     quality_install(base, s);
     taa_install(base);
+    linkplay_install(base, config_get_bool("pkp", "link_interact_everywhere", false));
+}
+void frame_all(bool in_game, double step_seconds, play::GameFrame* out) {
+    linkplay_frame();   // the first frame checks main (loaded by now) for Interact everywhere
+    play_frame(in_game, step_seconds, out);
 }
 void settings_changed_all(const play::Settings& s) {
     play_settings_changed(s);
     quality_settings_changed(s);
 }
 void remove_all() {
+    linkplay_remove();
     taa_remove();
     quality_remove();
     menu_remove();
@@ -58,7 +66,7 @@ const play::GamePlay& game_play() {
         p.install_render = &play_install_render;
         p.install = &install_all;
         p.remove = &remove_all;
-        p.frame = &play_frame;
+        p.frame = &frame_all;
         p.settings_changed = &settings_changed_all;
         p.display_live = &play_display_live;
         p.display_hook_calls = &play_display_calls;

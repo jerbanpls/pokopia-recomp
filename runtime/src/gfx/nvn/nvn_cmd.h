@@ -77,6 +77,12 @@ struct P_DrawIndirect {
     int64_t stride;
     uint64_t index_address, indirect_address, count_address;
 };
+// Indirect draw arguments the CPU read from guest memory (vertex/index count, instance count) that no real draw has: memory the GPU had
+// not written yet when it was read holds anything (an instance count of 1065353216 = 1.0f kept the GPU past Windows' timeout, and a
+// count near 2^32 sizes a 16 GiB index list). Such a draw is skipped.
+constexpr uint32_t kIndirectMaxInstances = 65536;
+constexpr uint32_t kIndirectMaxCount = 1u << 24;
+constexpr bool indirect_args_plausible(uint32_t count, uint32_t instances) { return count <= kIndirectMaxCount && instances <= kIndirectMaxInstances; }
 struct P_DrawTexture { uint64_t handle; float dst[4]; float src[4]; };                       // x0,y0,x1,y1 regions
 
 struct P_ClearColor { uint32_t target, kind, mask, pad; uint32_t value[4]; };                  // kind: 0 float, 1 int, 2 uint (value holds the 32-bit words)

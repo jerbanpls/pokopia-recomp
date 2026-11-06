@@ -20,6 +20,7 @@
 #include <tuple>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "nxrt/config.h"
 #include "nxrt/frame_limiter.h"
@@ -109,7 +110,10 @@ struct GState {
     uint32_t nvp = 0;
     int32_t sc[16][4] = {};
     uint32_t nsc = 0;
-    float dr[16][2] = {};
+    // near/far per viewport; NVN's default range is 0..1. A game-set 0..0 is a real range (the placement indicator draws
+    // its outline and fill with it to pin them to depth 0, issue #120), so it is passed through, never widened.
+    float dr[16][2] = {{0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1},
+                       {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}, {0, 1}};
     bool depth_bounds = false;
     float db_near = 0, db_far = 1;
     uint32_t stencil_ref[2] = {0, 0}, stencil_vmask[2] = {0xff, 0xff}, stencil_wmask[2] = {0xff, 0xff};
@@ -801,8 +805,8 @@ void set_viewports_and_scissors() {
         // Upper-left origin: window y is the image row from the top and NDC +y is the top edge of the rectangle (negative height).
         // Lower-left origin (the GL convention): window y 0 is memory row 0 and NDC -y is the first row, so no flip.
         const bool lower_left = S.window_origin == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT;
-        vp[i] = lower_left ? VkViewport{x, y, w, h, S.dr[i][0], S.dr[i][1] == 0.0f && S.dr[i][0] == 0.0f ? 1.0f : S.dr[i][1]}
-                           : VkViewport{x, y + h, w, -h, S.dr[i][0], S.dr[i][1] == 0.0f && S.dr[i][0] == 0.0f ? 1.0f : S.dr[i][1]};
+        vp[i] = lower_left ? VkViewport{x, y, w, h, S.dr[i][0], S.dr[i][1]}
+                           : VkViewport{x, y + h, w, -h, S.dr[i][0], S.dr[i][1]};
         if (i < S.nsc) sc[i] = scissor_rect(S.sc[i]);
         else sc[i] = {{0, 0}, P.extent};
     }
@@ -1493,6 +1497,12 @@ bool compute_direct_on() {
 // Every result still only in the pool copy goes back to the pool (in queue order, before what is recorded next).
 void flush_compute_out(int why) {
     if (!out_any()) return;
+    // [nvn] pool_copy: out entries need a pool copy (mirror) or a held result, and copy pools have neither (lazy pools get no mirror,
+    // out_lazy is off), so nothing is held; were one there, its copy-back into the shadow would be unrecorded: say so once.
+    if (pool_copy_on()) {
+        static bool noted = false;
+        if (!noted) { noted = true; NXLOG_W("nvn.replay", "pool_copy: a compute result is held in a pool copy; its copy-back is not recorded as a GPU write"); }
+    }
     end_pass();
     if (out_flush(F->cb, 0, UINT64_MAX, why)) {
         ++g_sh_flushes;
@@ -1566,6 +1576,7 @@ const uint8_t* cpu_view(uint64_t addr, uint64_t size);   // below
 // arguments (and draw count) when the CPU can read them (not a held result, not written by a submission that has not completed).
 // Otherwise the GPU writes them too and nobody knows the count here: everything from index_address to the end of its pool.
 uint64_t indirect_index_span(const P_DrawIndirect& p) {
+    PoolReasonScope pr_(kReasonIndirect);
     const uint32_t isz0 = index_size_bytes(static_cast<int>(p.type));
     const uint64_t isz = isz0 ? isz0 : 4;
     const uint64_t stride = p.stride ? static_cast<uint64_t>(p.stride) : 20;
@@ -1586,6 +1597,7 @@ uint64_t indirect_index_span(const P_DrawIndirect& p) {
     for (uint64_t i = 0; i < n; ++i) {
         uint32_t v[3];
         std::memcpy(v, a + i * stride, sizeof v);   // count, instance count, first index
+        if (!indirect_args_plausible(v[0], v[1])) return whole();   // not what the GPU will read (stale): the whole pool, as when unreadable
         if (v[0] && v[1]) end = std::max(end, (static_cast<uint64_t>(v[2]) + v[0]) * isz);
     }
     return end;
@@ -1757,6 +1769,8 @@ void shadows_after_dispatch() {
         if (!any) { memory_barrier(F->cb); any = true; }
         VkBufferCopy c = {0, u.host.offset, u.size};
         vkCmdCopyBuffer(F->cb, u.buf, u.host.buffer, 1, &c);
+        // [nvn] pool_copy: u.host is a shadow; the binding recorded this range as a GPU write already (gpu_wrote), the copy-back is that write
+        if (pool_copy_on()) pcopy_note_write(u.addr, u.size, u.host.buffer);
         g_sh_bytes_out += u.size;
         if (u.mirror.buf) {
             VkBufferCopy mc = {0, u.mirror.offset, u.size};
@@ -1798,7 +1812,11 @@ bool tsr_jitter(uint32_t* words, size_t n_words) {
     Texture* d = S.depth_tex.get();
     if (!d || !tex_gpu(d)) return false;
     const VkExtent3D e = tex_image_extent(d, 0);
-    return extras::temporal_jitter_block(words, n_words, e.width, e.height, g_tsr_frame);
+    float fx = 1.0f, fy = 1.0f;
+    extras::scene_fraction(&fx, &fy);   // the scene's viewport is that part of the target: half a pixel of it
+    const uint32_t w = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(e.width * fx)));
+    const uint32_t h = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(e.height * fy)));
+    return extras::temporal_jitter_block(words, n_words, w, h, g_tsr_frame);
 }
 
 // Descriptor set number `set` of the bound program: the one of the last draw (SetMemo below), a set of this submission with the same contents (g_set_cache), or a new one.
@@ -1933,6 +1951,8 @@ VkDescriptorSet build_set_resolved(const ProgLayout& pl, uint32_t set) {
         w.dstBinding = d.binding;
         w.descriptorCount = 1;
         w.descriptorType = d.type;
+        PoolReasonScope pr_(d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? kReasonUniform : d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? kReasonStorage :
+                            d.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || d.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ? kReasonTexel : pool_reason());
         if (d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             RpScope rpb_(kRpBuf, g_rp_fine);
             VkDescriptorBufferInfo bi = {dummy_buffer(), 0, 65536};
@@ -2509,6 +2529,28 @@ void temporal_gbuffer_note() {
     if (extras::temporal_camera_ready()) g_tsr_depth = S.depth_tex;
 }
 
+// The game's scene covers only part of its targets (extras::scene_fraction, Pokopia's [upscale] scene_scale, #116): the part of a scene
+// image of size `scene` that holds it, and the size of the image the tone-map draw then needs, out / fraction, so that its own lookup at
+// uv * fraction lands on the upscaled result in that image's top-left out-sized corner. False: the whole image is the scene.
+bool scene_part(VkExtent2D scene, VkExtent2D out, VkExtent2D* part, VkExtent2D* out_tex) {
+    float fx = 1.0f, fy = 1.0f;
+    extras::scene_fraction(&fx, &fy);
+    if (fx >= 1.0f && fy >= 1.0f) return false;
+    part->width = std::clamp<uint32_t>(static_cast<uint32_t>(std::lround(scene.width * fx)), 1, scene.width);
+    part->height = std::clamp<uint32_t>(static_cast<uint32_t>(std::lround(scene.height * fy)), 1, scene.height);
+    // rounded down: fraction * out_tex <= out, so the draw's lookups at uv * fraction stay inside the written out-sized corner
+    out_tex->width = std::max<uint32_t>(out.width, static_cast<uint32_t>(out.width / fx));
+    out_tex->height = std::max<uint32_t>(out.height, static_cast<uint32_t>(out.height / fy));
+    static bool told = false;
+    if (!told) {
+        told = true;
+        NXLOG_I(kTag, "scene upscale: the scene covers %ux%u of its %ux%u target (fraction %.3f x %.3f): %ux%u -> %ux%u, handed to the tone-map draw "
+                "in a %ux%u image", part->width, part->height, scene.width, scene.height, fx, fy, part->width, part->height, out.width, out.height,
+                out_tex->width, out_tex->height);
+    }
+    return true;
+}
+
 // The tone-map draw with a temporal mode: the largest 2D colour input is the HDR scene; the SDK's result (target size) replaces it for this draw.
 void temporal_for_draw(const ProgLayout& pl) {
     ++g_tsr_frame;                                                        // one tone-map draw per frame: the next frame's jitter phase
@@ -2554,7 +2596,8 @@ void temporal_for_draw(const ProgLayout& pl) {
     }
     const DescriptorBinding& b = best->shader->refl.bindings[best->index];
     const VkExtent3D ce = tex_image_extent(best_r.tex, 0), de = tex_image_extent(depth, 0), te = tex_image_extent(target, 0);
-    const VkExtent2D render{std::min(ce.width, de.width), std::min(ce.height, de.height)};
+    VkExtent2D render{std::min(ce.width, de.width), std::min(ce.height, de.height)}, out_tex{};
+    if (VkExtent2D part{}; scene_part(render, VkExtent2D{te.width, te.height}, &part, &out_tex)) render = part;
     end_pass();                                                           // compute work cannot run inside a render pass
     tex_ensure_current(best_r.tex, *F);
     tex_transition(best_r.tex, *F, tex_sampled_layout(best_r.tex));
@@ -2565,7 +2608,7 @@ void temporal_for_draw(const ProgLayout& pl) {
     VkImageView dv = tex_sampled_view(depth, dr);
     if (!src || !dv) return;
     VkImageView out = extras::temporal_evaluate(&device(), F->cb, src, dv, tex_sampled_layout(depth), render, VkExtent2D{te.width, te.height},
-                                                S.depth_mode == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
+                                                S.depth_mode == NVN_DEPTH_MODE_NEAR_IS_MINUS_W, out_tex);
     g_dirty = kAllDirty;                                                  // the SDKs bind their own compute state
     shadow_invalidate();
     if (out) {
@@ -2585,7 +2628,7 @@ void scene_upscale_for_draw(const ProgLayout& pl) {
     if (!fs || !extras::scene_upscale_wanted() || S.ncolor == 0 || !S.color_tex[0] || !extras::hdr_is_tonemap(fs->spirv, fs->hash)) return;
     Texture* target = S.color_tex[0].get();
     if (!tex_gpu(target)) return;
-    const VkExtent3D te = tex_extent(target, 0);
+    const VkExtent3D te = tex_image_extent(target, 0);   // image sizes: with a render scale the upscaler works on the real pixels
     for (const BindingDesc& d : pl.bindings) {
         if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
         const DescriptorBinding& b = d.shader->refl.bindings[d.index];
@@ -2593,17 +2636,20 @@ void scene_upscale_for_draw(const ProgLayout& pl) {
         if (view_type_for(b) != VK_IMAGE_VIEW_TYPE_2D) continue;
         TexResolved r = resolve_texture(d);
         if (!r.tex || !tex_gpu(r.tex) || shares_image(r.tex, S.depth_tex.get())) continue;
-        const VkExtent3D se = tex_extent(r.tex, 0);
-        if (se.width >= te.width && se.height >= te.height) return;          // nothing to enlarge
-        extras::SpatialUpscaler* su = extras::scene_upscaler(&device(), VkExtent2D{se.width, se.height}, VkExtent2D{te.width, te.height});
+        const VkExtent3D se = tex_image_extent(r.tex, 0);
+        // the scene is either a smaller image or the top-left part of a full-size one (scene_part)
+        VkExtent2D in_view{se.width, se.height}, out_tex{};
+        if (!scene_part(in_view, VkExtent2D{te.width, te.height}, &in_view, &out_tex) && se.width >= te.width && se.height >= te.height) return;   // nothing to enlarge
+        if (in_view.width >= te.width && in_view.height >= te.height) return;
+        extras::SpatialUpscaler* su = extras::scene_upscaler(&device(), in_view, VkExtent2D{te.width, te.height});
         if (!su) return;
         end_pass();                                                           // compute work cannot run inside a render pass
         tex_ensure_current(r.tex, *F);
         tex_transition(r.tex, *F, tex_sampled_layout(r.tex));
         VkImageView src = tex_sampled_view(r.tex, make_request(b, r));
         if (!src) return;
-        VkImageView up = su->upscale(F->cb, src, VkExtent2D{se.width, se.height}, VkExtent2D{se.width, se.height}, VkExtent2D{te.width, te.height}, true,
-                                     extras::scene_upscale_prescale(), extras::upscale_sharpness());
+        VkImageView up = su->upscale(F->cb, src, in_view, VkExtent2D{se.width, se.height}, VkExtent2D{te.width, te.height}, true,
+                                     extras::scene_upscale_prescale(), extras::upscale_sharpness(), out_tex);
         shadow_invalidate();
         if (up) {
             g_su_tex = r.tex;
@@ -2686,6 +2732,7 @@ const ShaderInfo* tcs_now() { return S.stage[kTessCtl] ? S.stage[kTessCtl] : g_g
 
 bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* topo_out) {
     RpScope rp_all(kRpDraw);
+    PoolReasonScope pr_(kReasonVertex);
     ResolveScope rs_;
     const ShaderInfo* vs = S.stage[kVertex];
     if (!vs) { log_once("draw-no-vs", "draw without a vertex shader skipped"); return false; }
@@ -3074,12 +3121,22 @@ bool bind_u32_indices(const std::vector<uint32_t>& idx) {
     return true;
 }
 
+// [gfx] gpu_checkpoints = all: a checkpoint before the draw names it (vertex and fragment shader, counts) if the device is lost while it runs.
+// One compare when off or without NVIDIA's extension. Indirect: a, b = the guest address of the arguments, c = the draw count limit.
+void checkpoint_draw(uint32_t a, uint32_t b, uint32_t c, bool indirect) {
+    gfx::Device& d = device();
+    if (!d.checkpoints_on(gfx::Device::Checkpoint::Draw)) return;
+    d.checkpoint(F->cb, gfx::Device::Checkpoint::Draw, S.stage[kVertex] ? &S.stage[kVertex]->hash : nullptr,
+                 S.stage[kFragment] ? &S.stage[kFragment]->hash : nullptr, a, b, c, indirect);
+}
+
 void do_draw_arrays(const P_DrawArrays& p) {
     count_primitives(p.mode, p.count, p.instance_count);
     g_draw_base_instance = p.base_instance;
     VkPrimitiveTopology topo;
     if (!begin_draw(static_cast<int>(p.mode), false, 0, &topo)) { counters().draws_skipped.fetch_add(1); return; }
     const PrimConversion conv = prim_conversion(static_cast<int>(p.mode));
+    checkpoint_draw(p.count, std::max<uint32_t>(1, p.instance_count), 0, false);
     if (conv == PrimConversion::None) {
         TRACE("    vertices %u instances %u first %u", p.count, p.instance_count, p.first);
         vkCmdDraw(F->cb, p.count, std::max<uint32_t>(1, p.instance_count), p.first, p.base_instance);
@@ -3099,6 +3156,7 @@ void do_draw_arrays(const P_DrawArrays& p) {
 }
 
 void do_draw_elements(const P_DrawElements& p) {
+    PoolReasonScope pr_(kReasonIndex);
     count_primitives(p.mode, p.count, p.instance_count);
     g_draw_base_instance = p.base_instance;
     VkPrimitiveTopology topo;
@@ -3161,6 +3219,7 @@ void do_draw_elements(const P_DrawElements& p) {
     const uint32_t isz = index_size_bytes(static_cast<int>(p.type));
     const PrimConversion conv = prim_conversion(static_cast<int>(p.mode));
     const uint8_t* src = host_ptr(p.index_address);
+    checkpoint_draw(p.count, std::max<uint32_t>(1, p.instance_count), 0, false);
     if (conv != PrimConversion::None || isz == 1) {
         // widen to 32 bit and/or convert the primitive
         std::vector<uint32_t> in(p.count);
@@ -3231,6 +3290,7 @@ void draw_indirect_cpu(const P_DrawIndirect& p, PrimConversion conv, uint32_t is
         std::memcpy(v, a, cmd_size);
         const uint32_t count = v[0], instances = v[1];
         if (!count || !instances) continue;
+        if (!indirect_args_plausible(count, instances)) { note_unsupported("indirect draw conversion: implausible arguments (stale guest memory?)"); continue; }
         std::vector<uint32_t> in(count);
         int32_t base_vertex = 0;
         uint32_t base_instance = v[3];
@@ -3252,6 +3312,7 @@ void draw_indirect_cpu(const P_DrawIndirect& p, PrimConversion conv, uint32_t is
         count_primitives(p.mode, count, instances);
         const std::vector<uint32_t> idx = convert_prim_indices(conv, in);
         if (idx.empty() || !bind_u32_indices(idx)) continue;
+        checkpoint_draw(count, instances, 0, false);   // the CPU read the arguments: a direct draw
         vkCmdDrawIndexed(F->cb, static_cast<uint32_t>(idx.size()), instances, 0, base_vertex, base_instance);
         drew = true;
     }
@@ -3265,6 +3326,7 @@ void draw_indirect_cpu(const P_DrawIndirect& p, PrimConversion conv, uint32_t is
 }
 
 void do_draw_indirect(const P_DrawIndirect& p) {
+    PoolReasonScope pr_(kReasonIndirect);
     const bool indexed = p.type != 0xffffffffu;
     // the base instance is in the arguments, which the GPU may write and a multi-draw holds one of per draw: the vertex shaders read it
     // as Vulkan's BaseInstance (spirv_base_instance_from_c0), so the c[0] word is not needed and stays 0
@@ -3286,8 +3348,10 @@ void do_draw_indirect(const P_DrawIndirect& p) {
     BufRef ib = held_or_pool(p.indirect_address, (p.stride ? static_cast<uint64_t>(p.stride) : cmd_size) * (n_cmds - 1) + cmd_size, kOutIndirect, false);
     if (indexed) {
         BufRef xb = resolve_buffer(p.index_address, 4);
+        if (pool_copy_on()) pool_copy_touch(p.index_address, indirect_index_span(p));   // [nvn] pool_copy: every index the draw may read
         bind_index_buffer(F->cb, xb.buffer, xb.offset, vk_index_type(static_cast<int>(p.type)));
     }
+    checkpoint_draw(static_cast<uint32_t>(p.indirect_address), static_cast<uint32_t>(p.indirect_address >> 32), static_cast<uint32_t>(n_cmds), true);
     if (p.multi && p.count_address) {
         BufRef cb = held_or_pool(p.count_address, 4, kOutIndirect, false);
         const uint32_t stride = static_cast<uint32_t>(p.stride ? p.stride : cmd_size);
@@ -3327,6 +3391,7 @@ void do_draw_xfb(const P_DrawXfb& p) {
     uint32_t stride = g_key_attr_count ? S.stream[g_key_binding[0]].stride : 0;
     for (uint32_t b = 0; !stride && b < 16; ++b) stride = S.stream[b].stride;
     if (!stride) { note_unsupported("DrawTransformFeedback with no vertex stream stride"); counters().draws_skipped.fetch_add(1); return; }
+    checkpoint_draw(static_cast<uint32_t>(p.control), static_cast<uint32_t>(p.control >> 32), 1, true);   // the count is the section's byte counter
     vkCmdDrawIndirectByteCountEXT(F->cb, 1, 0, g_xfb_counter.buffer, static_cast<VkDeviceSize>(slot) * kXfbSlotBytes, 0, stride);
     counters().draws.fetch_add(1, std::memory_order_relaxed); ft::split_count(ft::kCntDraws);
     g_pass_draws++;
@@ -3334,6 +3399,44 @@ void do_draw_xfb(const P_DrawXfb& p) {
 }
 
 std::string g_cs_missing;   // trace: the untranslated block(s) of the bound compute program ("cs -" dispatches)
+
+// ---- [nvn] async_compute: which dispatches may be skipped while their pipeline builds -----------------------------------------------
+// Only one whose writes the CPU cannot see: every storage buffer it binds lies in one pool with NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS (not
+// virtual: its physical backing may be CPU-visible) and in no 64 KiB granule a buffer copy ever read into a CPU-visible pool, and no storage
+// image it binds is a texture download_texture read back. Image buffers (storage texel buffers) are not checked: such a dispatch is never
+// skipped. Render thread.
+std::unordered_set<uint64_t> g_cs_cpu_read;   // granules (address >> 16) copied into CPU-visible pools (run_list, CopyBufferToBuffer)
+
+void note_copy_for_cpu(uint64_t src, uint64_t dst, uint64_t size) {
+    static const bool on = async_compute_on();
+    if (!on || !size || (pool_flags_at(dst) & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return;
+    size = std::min<uint64_t>(size, 1ull << 34);              // a malformed size: bounded (the copy itself fails to resolve)
+    for (uint64_t g = src >> 16, e = (src + size - 1) >> 16; g <= e; ++g) g_cs_cpu_read.insert(g);
+}
+
+bool dispatch_cpu_blind(const ProgLayout& pl) {
+    for (const BindingDesc& d : pl.bindings) {
+        const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+        if (d.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) return false;
+        if (d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+            const TexResolved r = resolve_image(d);
+            if (r.tex && tex_was_read_back(r.tex)) return false;
+            continue;
+        }
+        if (d.type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b.nvn.source != NvnSource::StorageBuffer) continue;   // read only, or ours
+        const int slot = b.nvn.index >= 0 ? b.nvn.index : storage_slot_for(d.nvn_stage, b.nvn.c0_offset);       // as bind_sets
+        if (slot < 0 || slot >= 16 || !S.ssbo[d.nvn_stage][slot].addr) continue;                                // the dummy is bound
+        const GState::Bind& bind = S.ssbo[d.nvn_stage][slot];
+        if (!bind.size) return false;                         // the range would be the rest of the pool: not checked
+        const uint64_t lo = bind.addr, hi = bind.addr + bind.size - 1;
+        const uint32_t f = pool_flags_at(lo);
+        if (!(f & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || (f & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return false;
+        if (pool_lookup(lo).pool != pool_lookup(hi).pool) return false;
+        for (uint64_t g = lo >> 16; g <= (hi >> 16); ++g)
+            if (g_cs_cpu_read.count(g)) return false;
+    }
+    return true;
+}
 
 void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     RpScope rp_all(kRpDispatch);
@@ -3375,6 +3478,18 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
             }
         }
     }
+    // [nvn] async_compute in play (the loading gate): a dispatch whose pipeline is not built and whose writes the CPU cannot see is skipped
+    // while its pipeline goes first in line on the async threads (pop-in for a frame or two). Any other is built here as before and logged.
+    if (async_compute_on() && gpl_gate_open() && !compute_pipeline_done(cs, *pl) && dispatch_cpu_blind(*pl) && compute_queue_front(cs, *pl)) {
+        compute_note_skipped();
+        ft::mark("cs.skip");
+        static int logged = 0;
+        if (logged < 50) {
+            ++logged;
+            NXLOG_I(kTag, "compute: dispatch skipped while its pipeline builds in the background: %s", cs->hash.c_str());
+        }
+        return;
+    }
     VkPipeline pipe = compute_pipeline(cs, *pl);
     if (!pipe) return;
     vkCmdBindPipeline(F->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
@@ -3388,6 +3503,13 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     if (g_sh_copied) {
         memory_barrier(F->cb);     // the copies into the shadows before the dispatch reads them
         gstamp("shadow in");
+    }
+    // [gfx] gpu_checkpoints: a checkpoint before the dispatch names it (shader, groups or the guest address of indirect arguments) if the
+    // device is lost while it runs. One compare when off or without NVIDIA's extension.
+    if (device().checkpoints_on(gfx::Device::Checkpoint::Dispatch)) {
+        if (indirect) device().checkpoint(F->cb, gfx::Device::Checkpoint::Dispatch, &cs->hash, nullptr, static_cast<uint32_t>(indirect),
+                                          static_cast<uint32_t>(indirect >> 32), 0, true);
+        else device().checkpoint(F->cb, gfx::Device::Checkpoint::Dispatch, &cs->hash, nullptr, x, y, z, false);
     }
     if (indirect) {
         vkCmdDispatchIndirect(F->cb, ind.buffer, ind.offset);
@@ -3557,6 +3679,7 @@ void do_clear_texture(const P_ClearTexture& p) {
 }
 
 void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
+    PoolReasonScope pr_(kReasonImageCopy);
     Texture* t = p.tex;
     if (t && t->b.target == NVN_TEXTURE_TARGET_3D) {
         static int logged = 0;
@@ -3571,14 +3694,6 @@ void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
     }
     if (!t || !tex_gpu(t)) return;
     end_pass();
-    if (tex_scale(t) != 1.0f) {
-        static int logged = 0;
-        if (logged++ < 10) {
-            char a[96];
-            NXLOG_W(kTag, "%s a scaled render target %s: the copy uses NVN texel coordinates (wrong part of the image)", to_texture ? "buffer copied into" : "copy from",
-                    tex_desc(t, a, sizeof a));
-        }
-    }
     SubRes s = sub_of(p.view, p.has_view);
     const VkExtent3D ext = tex_extent(t, s.level);
     P_CopyRegion r = p.has_region ? p.region : P_CopyRegion{0, 0, 0, static_cast<int32_t>(ext.width), static_cast<int32_t>(ext.height), static_cast<int32_t>(ext.depth)};
@@ -3597,14 +3712,46 @@ void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
     c.imageExtent = {rw, rh, rd};
     if (t->b.target != NVN_TEXTURE_TARGET_3D && t->layers > 1 && !p.has_view) { c.imageSubresource.layerCount = tex_layers(t); c.imageExtent.depth = 1; }
     if (t->b.target != NVN_TEXTURE_TARGET_3D && rd > 1) { c.imageSubresource.layerCount = rd; c.imageSubresource.baseArrayLayer = s.layer + static_cast<uint32_t>(std::max(0, r.z)); c.imageOffset.z = 0; c.imageExtent.depth = 1; }
-    const uint64_t buf_bytes = stride * ((rh + bh - 1) / bh) * rd;
+    // The bytes Vulkan touches: every layer / slice and row at the buffer's strides, the last row only as wide as the region. A copy
+    // whose buffer does not hold all of it (an address in no importable pool resolves to the 64 KiB dummy buffer, a chunk or span
+    // import shorter than the range, a copy of every layer sized for one) would read or write past the end of a VkBuffer: device lost
+    // on NVIDIA (issue #121, saving a Pokédex photo reads a whole screen back into a buffer). Such copies are skipped.
+    const uint64_t rows = (rh + bh - 1) / bh;
+    if (c.imageSubresource.layerCount <= 1 && c.imageExtent.depth <= 1) c.bufferImageHeight = 0;   // one slice: the image stride is not used
+    const uint64_t row_len = c.bufferRowLength ? (c.bufferRowLength + bw - 1) / bw * bpb : row_bytes;
+    const uint64_t slice_rows = c.bufferImageHeight ? (c.bufferImageHeight + bh - 1) / bh : rows;
+    const uint64_t slices = static_cast<uint64_t>(c.imageSubresource.layerCount) * std::max<uint32_t>(1, c.imageExtent.depth);
+    const bool layout_ok = rw && rh && rows && (!c.bufferRowLength || c.bufferRowLength >= rw) && (!c.bufferImageHeight || c.bufferImageHeight >= rh);
+    const uint64_t buf_bytes = layout_ok ? ((slices - 1) * slice_rows + (rows - 1)) * row_len + row_bytes : 0;
+    const auto refused = [&](const char* why) {
+        static int logged = 0;
+        if (logged++ < 20) {
+            char a[96];
+            NXLOG_W(kTag, "%s %s skipped: %s (buffer %llx, %llu bytes, %ux%u region, row %lld image %lld)", to_texture ? "buffer copy into" : "copy to a buffer from",
+                    tex_desc(t, a, sizeof a), why, static_cast<unsigned long long>(p.address), static_cast<unsigned long long>(buf_bytes), rw, rh,
+                    static_cast<long long>(p.row_stride), static_cast<long long>(p.image_stride));
+        }
+    };
+    if (!layout_ok) { refused("the region is empty or the buffer strides are smaller than it"); return; }
     if (!to_texture) compute_out_guard(p.address, buf_bytes, kOutBufferWrite);     // written: held results there go back first
     BufRef br = to_texture ? held_or_pool(p.address, buf_bytes, kOutBufferRead, true) : resolve_buffer(p.address, buf_bytes);
+    if (!br.ok || br.avail < buf_bytes) { refused("the buffer range is not wholly in an imported memory pool"); return; }
     c.bufferOffset = br.offset;
     // The region and buffer layout above are in the NVN format. An image in another layout (an HDR-promoted RGBA16F target, a wider
     // fallback, transcoded ASTC) would make Vulkan address the buffer in its own texel size: past the game's bytes (issue #76: device
-    // lost on NVIDIA) and in the wrong encoding. Such copies convert through a blit, or are skipped.
+    // lost on NVIDIA) and in the wrong encoding. Such copies convert through a blit, or are skipped. A scaled render target goes through
+    // the same blit (its region in image texels, filtered down to the NVN size) so the buffer gets the whole picture at the size the
+    // game asked for; when that blit is not possible it is copied as before (the NVN texels: the top-left part of the image).
     const bool convert = fi && !vk_copy_layout_matches(tex_vk_format(t), fi->vk, c.imageSubresource.aspectMask);
+    const bool rescale = fi && !convert && tex_scale(t) != 1.0f;
+    const auto unscaled = [&](const char* why) {
+        static int logged = 0;
+        if (logged++ < 10) {
+            char a[96];
+            NXLOG_W(kTag, "%s a scaled render target %s: no scaling blit (%s), the copy uses NVN texel coordinates (wrong part of the image)",
+                    to_texture ? "buffer copied into" : "copy from", tex_desc(t, a, sizeof a), why ? why : "?");
+        }
+    };
     const auto skipped = [&](const char* why) {
         static int logged = 0;
         if (logged++ < 20) {
@@ -3619,16 +3766,24 @@ void do_copy_buffer_texture(const P_CopyBufTex& p, bool to_texture) {
         tev(t, "copy_buffer_to_texture", p.address, p.has_view ? 1 : 0);
         for (uint32_t i = 0; i < c.imageSubresource.layerCount; ++i) tex_sparse_before_copy(t, c.imageSubresource.baseArrayLayer + i, s.level);
         const char* why = nullptr;
-        if (!convert) vkCmdCopyBufferToImage(F->cb, br.buffer, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-        else if (!tex_copy_buffer_converted(t, *F, br.buffer, c, true, &why)) { skipped(why); return; }
+        if (convert) {
+            if (!tex_copy_buffer_converted(t, *F, br.buffer, c, true, &why)) { skipped(why); return; }
+        } else if (!rescale || !tex_copy_buffer_converted(t, *F, br.buffer, c, true, &why)) {
+            if (rescale) unscaled(why);
+            vkCmdCopyBufferToImage(F->cb, br.buffer, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        }
         tex_mark_gpu_written(t);
     } else {
         tex_ensure_current(t, *F);
         tex_transition(t, *F, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         const char* why = nullptr;
-        if (!convert) vkCmdCopyImageToBuffer(F->cb, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, br.buffer, 1, &c);
-        else if (!tex_copy_buffer_converted(t, *F, br.buffer, c, false, &why)) { skipped(why); return; }
-        gpu_wrote(p.address, stride * ((rh + bh - 1) / bh) * rd, kWriteImageCopy);
+        if (convert) {
+            if (!tex_copy_buffer_converted(t, *F, br.buffer, c, false, &why)) { skipped(why); return; }
+        } else if (!rescale || !tex_copy_buffer_converted(t, *F, br.buffer, c, false, &why)) {
+            if (rescale) unscaled(why);
+            vkCmdCopyImageToBuffer(F->cb, tex_image(t), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, br.buffer, 1, &c);
+        }
+        gpu_wrote(p.address, buf_bytes, kWriteImageCopy);
     }
     memory_barrier(F->cb);
     counters().copies.fetch_add(1, std::memory_order_relaxed);
@@ -3727,6 +3882,7 @@ void do_downsample(const P_Downsample& p) {
 }
 
 void do_write_memory(uint64_t gpu_addr, const void* data, uint32_t size) {
+    PoolReasonScope pr_(kReasonUpdate);
     // a GPU-ordered write of up to 64 KiB into pool memory (UpdateUniformBuffer, counters, events)
     end_pass();
     memory_barrier(F->cb);
@@ -4015,6 +4171,7 @@ void run_list(const CmdList& list, int depth) {
             case Op::ClearTexture: do_clear_texture(r.payload<P_ClearTexture>()); break;
             case Op::ClearBuffer: {
                 const auto& p = r.payload<P_ClearBuffer>();
+                PoolReasonScope pr_(kReasonCopy);
                 end_pass();
                 BufRef b = resolve_buffer(p.address, p.size);
                 if (b.ok) vkCmdFillBuffer(F->cb, b.buffer, b.offset, p.size & ~3ull, p.value);
@@ -4026,6 +4183,8 @@ void run_list(const CmdList& list, int depth) {
             }
             case Op::CopyBufferToBuffer: {
                 const auto& p = r.payload<P_CopyBufferToBuffer>();
+                note_copy_for_cpu(p.src, p.dst, p.size);   // [nvn] async_compute: what is copied into a CPU-visible pool, the CPU reads
+                PoolReasonScope pr_(kReasonCopy);
                 end_pass();
                 BufRef s = held_or_pool(p.src, p.size, kOutBufferRead, true), d = resolve_buffer(p.dst, p.size);
                 if (s.ok && d.ok) {
@@ -4069,6 +4228,7 @@ void run_list(const CmdList& list, int depth) {
                         if (b.ok && g_occ_last >= 0) {
                             vkCmdCopyQueryPoolResults(F->cb, g_occ_pool, static_cast<uint32_t>(g_occ_last), 1, b.buffer, b.offset, 16,
                                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                            if (pool_copy_on()) gpu_wrote(p.address, 16, kWriteCopy);   // [nvn] pool_copy: the result lands in guest memory at completion
                             memory_barrier(F->cb);
                         }
                     }
@@ -4089,6 +4249,7 @@ void run_list(const CmdList& list, int depth) {
                             if (b.ok) {
                                 // the feedback query has two results (written, needed): the second would land on the timestamp word, which is written again after it
                                 vkCmdCopyQueryPoolResults(F->cb, cw.pool, static_cast<uint32_t>(cw.last), 1, b.buffer, b.offset, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                                if (pool_copy_on()) gpu_wrote(p.address, 16, kWriteCopy);   // [nvn] pool_copy: lands at completion
                                 memory_barrier(F->cb);
                                 if (&cw == &g_cw[1]) do_write_memory(p.address + 8, &rep.timestamp, 8);
                             }
@@ -4230,9 +4391,13 @@ void run_list(const CmdList& list, int depth) {
 // (Pokopia: 14 s at 60 fps before the title), so a run of light frames stays unpaced for up to [display] unpaced_loading_s (20, 0 = off)
 // seconds even without stalls. Once the game has drawn a real scene the stall rule alone applies, so a light screen in the world (a
 // menu, a fade) is never unpaced just for being light, and a frame with 16+ draws is always paced.
+// The detection always runs: its result (`want`) is also the loading gate of the compile paths (replay_loading, [nvn] gpl_gate = state).
+// Only the limiter action depends on [display] unpaced_loading.
+static bool g_loading = true;      // the detector's current `want`; loading until the first present (render thread)
+bool replay_loading() { return g_loading; }
+
 void note_frame_for_pacing() {
     static const bool on = nxrt::config_get_bool("display", "unpaced_loading", true);
-    if (!on) return;
     using clk = std::chrono::steady_clock;
     static uint64_t last_p = 0, last_d = 0;
     static int low = 0;
@@ -4252,9 +4417,15 @@ void note_frame_for_pacing() {
     static const double boot_s = std::max(0.0, nxrt::config_get_double("display", "unpaced_loading_s", 20.0));
     const bool boot_run = !full && now - low_since < std::chrono::duration<double>(boot_s);
     const bool want = low >= 3 && (now - last_stall < std::chrono::milliseconds(1500) || boot_run);
-    if (want != nxrt::frame_limiter_unpaced()) {
-        nxrt::frame_limiter_set_unpaced(want);
+    if (want != g_loading) {
+        g_loading = want;
         ft::mark(want ? "pace.loading" : "pace.playing", static_cast<uint32_t>(per));
+        if (!on)
+            NXLOG_I(kTag, "%s (present %llu, %llu draws; pacing unchanged: [display] unpaced_loading is false)", want ? "loading" : "playing",
+                    static_cast<unsigned long long>(p), static_cast<unsigned long long>(per));
+    }
+    if (on && want != nxrt::frame_limiter_unpaced()) {
+        nxrt::frame_limiter_set_unpaced(want);
         NXLOG_I(kTag, "pacing %s (present %llu, %llu draws)", want ? "off: loading" : "on", static_cast<unsigned long long>(p),
                 static_cast<unsigned long long>(per));
     }
@@ -4272,8 +4443,9 @@ void replay_begin_submit(Frame& f) {
     ft::split_count(ft::kCntSubmissions);
     g_rp_t0 = ft::on() ? ft::now_ns() : 0;
     RpScope rp_begin(kRpBegin);
-    gpl_note_presents(counters().presents.load(std::memory_order_relaxed));   // [nvn] gpl_async defers draws only while frames are flowing
+    gpl_note_presents(counters().presents.load(std::memory_order_relaxed));   // [nvn] gpl_gate = time: frames flowing = play
     note_frame_for_pacing();
+    gpl_latch_play(!replay_loading());   // [nvn] gpl_gate = state: play vs loading for the whole submission (a stall inside it cannot flip it)
     F = &f;
     { RpScope rp_(kRpTexPoll); ft::SplitScope sp_(ft::kSplSetup); tex_poll_cpu_writes(); }   // per call: see setup_coalesce_on (nvn_gpu_texture.cpp)
     if (extras::LowLatency* ll = extras::lowlat()) ll->submit_begin();     // RENDERSUBMIT_START of the frame (S14)

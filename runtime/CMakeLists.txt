@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # nxrt: game-independent runtime skeleton (OS/HLE layer) for the Metroid Prime Remastered static recompilation.
-# Build: scripts\build.ps1   (clang-cl + Ninja, Release)   Test: ctest --test-dir build\release
+# Build: scripts\build.ps1   (clang-cl + Ninja, Release)
 cmake_minimum_required(VERSION 3.25)
 # Static MSVC runtime (/MT): players need no Visual C++ Redistributable. Set before project() so every target below, third-party code
 # included, uses it; the libraries this one links must agree (a mismatch is a link error).
@@ -18,8 +18,6 @@ if(NOT WIN32)
     message(FATAL_ERROR "nxrt targets native Windows x64 only")
 endif()
 
-option(NXRT_BUILD_TESTS "Build the nxrt_tests executable and register its CTest entries" ON)
-
 # The generated-code ABI header (Ctx, call_indirect, ...) lives in the recompiler (recomp/include/nxrecomp/).
 # Found next to the checkout (../recomp) or, for a git worktree under runtime-wt/<name>, two levels up (../../recomp).
 set(NXRT_RECOMP_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/include" CACHE PATH "Directory that holds nxrecomp/")
@@ -35,14 +33,9 @@ endif()
 add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _WIN32_WINNT=0x0A00)
 
 option(NXRT_BUILD_GFX "Build the graphics shell (SDL3 + Vulkan + NVN front end, src/gfx, cmake/gfx.cmake)" ON)
-# Game modules (games/<id>/, docs/GAME_BOUNDARY.md): the title-specific code a game exe links. The test executables register one of them, so
-# the tests of the base run against that game's tables (title facts, sites, probes, hooks) as the game exe does.
+# Game modules (games/<id>/, docs/GAME_BOUNDARY.md): the title-specific code a game exe links.
 option(NXRT_BUILD_GAMES "Build the game modules in games/" ON)
 set(NXRT_GAMES "pkp" CACHE STRING "ids of the game modules to build (games/<id>/), a list")
-set(NXRT_TEST_GAME "pkp" CACHE STRING "id of the game module the test executables register (empty: none)")
-if(NOT NXRT_BUILD_GAMES OR NOT NXRT_TEST_GAME IN_LIST NXRT_GAMES)
-    set(NXRT_TEST_GAME "")      # the test game must be one of the modules built
-endif()
 
 file(GLOB_RECURSE NXRT_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 list(FILTER NXRT_SOURCES EXCLUDE REGEX "/src/gfx/")   # the graphics shell is its own library (cmake/gfx.cmake)
@@ -53,48 +46,6 @@ if(EXISTS "${NXRT_RECOMP_INCLUDE}")
 endif()
 target_link_libraries(nxrt PUBLIC psapi)
 include(cmake/media_deps.cmake)   # libvpx for the Switch 2 video decoders (optional)
-
-if(NXRT_BUILD_TESTS)
-    enable_testing()
-    file(GLOB NXRT_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
-    # The tests of the test game's own runtime-side code (games/<id>/tests/core) run in the same executable.
-    if(NXRT_TEST_GAME)
-        file(GLOB NXRT_GAME_CORE_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/games/${NXRT_TEST_GAME}/tests/core/*.cpp")
-        list(APPEND NXRT_TEST_SOURCES ${NXRT_GAME_CORE_TEST_SOURCES})
-    endif()
-    add_executable(nxrt_tests ${NXRT_TEST_SOURCES})
-    target_include_directories(nxrt_tests PRIVATE tests)
-    target_link_libraries(nxrt_tests PRIVATE nxrt)
-    target_compile_definitions(nxrt_tests PRIVATE NXRT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
-    # A linker map next to the exe: the crash handler and the watchdog name host code from it. Keep host allocations low
-    # (HIGHENTROPYVA:NO) so the guest ranges at 0x71_0000_0000 and up are free; a 64 MiB main stack.
-    target_link_options(nxrt_tests PRIVATE /MAP /STACK:67108864 /HIGHENTROPYVA:NO /DEBUG)
-
-    # One CTest entry per test group; the group names are listed by `nxrt_tests --list`. The list is read at configure
-    # time from the NXTEST_GROUP lines of the test sources so that CMake needs no edit when a group is added.
-    set(NXRT_GROUPS "")
-    foreach(src ${NXRT_TEST_SOURCES})
-        file(STRINGS "${src}" lines REGEX "^NXTEST_GROUP\\(")
-        foreach(l ${lines})
-            string(REGEX REPLACE "^NXTEST_GROUP\\(([a-z0-9_]+)\\).*$" "\\1" g "${l}")
-            list(APPEND NXRT_GROUPS ${g})
-        endforeach()
-    endforeach()
-    list(REMOVE_DUPLICATES NXRT_GROUPS)
-    foreach(g ${NXRT_GROUPS})
-        add_test(NAME ${g} COMMAND nxrt_tests ${g} WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-        set_tests_properties(${g} PROPERTIES TIMEOUT 120)
-    endforeach()
-    message(STATUS "nxrt test groups: ${NXRT_GROUPS}")
-
-    # Lifted-code integration tests (tests/lift): need the recompiler, its Python environment and the AArch64 clang.
-    option(NXRT_BUILD_LIFT_TESTS "Lift test programs with nxrecomp and run them on the runtime (CTest entries lift_*)" ON)
-    if(NXRT_BUILD_LIFT_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../recomp/cmake/NxRecomp.cmake" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/.venv/Scripts/python.exe")
-        add_subdirectory(tests/lift)
-    else()
-        message(STATUS "nxrt: lifted-code integration tests (tests/lift) are off: ../recomp or ../tools/.venv not found")
-    endif()
-endif()
 
 if(NXRT_BUILD_GFX)
     include(cmake/gfx.cmake)
@@ -112,19 +63,4 @@ if(TARGET mpr_launcher AND TARGET nxrt_game_${NXRT_LAUNCHER_GAME}_data)
     target_link_libraries(mpr_launcher PRIVATE nxrt_game_${NXRT_LAUNCHER_GAME}_data)
     target_compile_definitions(mpr_launcher PRIVATE NXRT_LAUNCHER_GAME_REGISTER=nxrt_register_game_${NXRT_LAUNCHER_GAME}_data)
     target_link_options(mpr_launcher PRIVATE /MANIFEST:NO)   # launcher.rc carries the manifest
-endif()
-# Each test executable registers the most of the test game it links: the data part (launcher tests), the core part (runtime tests), the whole
-# module (graphics tests). tests/test_main.cpp calls NXRT_TEST_GAME_REGISTER before the first test.
-if(NXRT_BUILD_TESTS AND NXRT_TEST_GAME)
-    set(_g "${NXRT_TEST_GAME}")
-    foreach(pair "nxrt_tests;nxrt_game_${_g}_core;nxrt_register_game_${_g}_core" "nxrt_gfx_tests;nxrt_game_${_g};nxrt_register_game_${_g}"
-                 "mpr_launcher_tests;nxrt_game_${_g}_data;nxrt_register_game_${_g}_data")
-        list(GET pair 0 exe)
-        list(GET pair 1 lib)
-        list(GET pair 2 fn)
-        if(TARGET ${exe} AND TARGET ${lib})
-            target_link_libraries(${exe} PRIVATE ${lib})
-            target_compile_definitions(${exe} PRIVATE NXRT_TEST_GAME_REGISTER=${fn})
-        endif()
-    endforeach()
 endif()

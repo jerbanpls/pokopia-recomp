@@ -74,6 +74,7 @@ std::map<uint64_t, VmInfo> g_vm;          // start -> block, guarded by g_vm_mu
 std::mutex g_heap_mu;
 HANDLE g_section = nullptr;
 uint64_t g_heap_size = 0;                 // 0 = no heap; otherwise the section size = size of the primary view
+uint32_t g_heap_commit_error = 0;         // GetLastError of the last failed heap_commit (heap_commit_error)
 std::vector<uint64_t> g_commit_bits;      // one bit per 4 KiB page of the section, set by heap_commit
 uint64_t g_committed = 0;                 // bytes of pages whose bit is set
 // Per 4 KiB page of the section, what the host reports for it: 0 never committed, 1 committed but no-access (a decommitted page or one
@@ -119,6 +120,11 @@ GaugeHook gauge_vm_blocks("mem.vm_blocks", [] {   // blocks of the Horizon-style
     std::lock_guard<std::mutex> lk(g_vm_mu);
     return static_cast<int64_t>(g_vm.size());
 });
+
+// Calls that change the state of heap pages (each one on a range a Vulkan host-pointer import covers invalidates that userptr BO): counted
+// per call, any thread.
+nxrt::GaugeCounter g_ctr_commits("mem.commits"), g_ctr_decommits("mem.decommits"), g_ctr_protects("mem.protects");
+bool in_heap_range(uint64_t start, uint64_t end) { return start >= kHeapBase && end <= kHeapBase + g_heap_size; }
 
 // [memory] fast_query = false: ask the host (VirtualQuery) instead of the page table above; for before/after measurements.
 bool fast_query() {
@@ -308,6 +314,7 @@ bool commit(uint64_t addr, uint64_t size, Prot p) {
     uint64_t start = 0, end = 0;
     if (!page_span(addr, size, &start, &end)) return false;
     if (start == end) return true;
+    if (in_heap_range(start, end)) g_ctr_commits.add(1);
     const ww::OsWriteScope wws(reinterpret_cast<void*>(start), end - start);   // the write tracker keeps out of the range while it changes
     if (!VirtualAlloc(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start), MEM_COMMIT, protect_of(p))) {
         DWORD e = GetLastError();
@@ -322,6 +329,7 @@ bool decommit(uint64_t addr, uint64_t size) {
     uint64_t start = 0, end = 0;
     if (!page_span(addr, size, &start, &end)) return false;
     if (start == end) return true;
+    if (in_heap_range(start, end)) g_ctr_decommits.add(1);
     const ww::OsWriteScope wws(reinterpret_cast<void*>(start), end - start);
     if (!VirtualFree(reinterpret_cast<void*>(start), static_cast<SIZE_T>(end - start), MEM_DECOMMIT)) {
         DWORD e = GetLastError();
@@ -337,6 +345,7 @@ bool protect(uint64_t addr, uint64_t size, Prot p) {
     if (!page_span(addr, size, &start, &end)) return false;
     if (start == end) return true;
     const DWORD np = protect_of(p);
+    if (in_heap_range(start, end)) g_ctr_protects.add(1);
     const ww::OsWriteScope wws(reinterpret_cast<void*>(start), end - start);   // pages the write tracker armed get this protection, not its own
     {   // heap: the page table says whether every page is committed, so one VirtualProtect does it (no VirtualQuery over the view)
         std::lock_guard hk(g_heap_mu);
@@ -522,6 +531,7 @@ bool heap_commit(uint64_t offset, uint64_t size) {
         return false;
     }
     if (size == 0) return true;
+    g_ctr_commits.add(1);
     if (offset > g_heap_size || size > g_heap_size - offset) {
         NXLOG_E(kTag, "heap_commit: [%llx, +%llx) is outside the %llu MiB section",
                 static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size),
@@ -534,9 +544,11 @@ bool heap_commit(uint64_t offset, uint64_t size) {
     if (!VirtualAlloc(reinterpret_cast<void*>(kHeapBase + start), static_cast<SIZE_T>(end - start), MEM_COMMIT,
                       PAGE_READWRITE)) {
         DWORD e = GetLastError();
-        NXLOG_E(kTag, "heap_commit [%llx, +%llx): VirtualAlloc failed, error %lu",
+        g_heap_commit_error = e;
+        NXLOG_E(kTag, "heap_commit [0x%llx, +0x%llx) (%.2f GiB): VirtualAlloc failed, error %lu%s",
                 static_cast<unsigned long long>(start), static_cast<unsigned long long>(end - start),
-                static_cast<unsigned long>(e));
+                static_cast<double>(end - start) / (1024.0 * 1024.0 * 1024.0), static_cast<unsigned long>(e),
+                e == ERROR_COMMITMENT_LIMIT ? " (Windows' commit limit: RAM plus page file is used up; the page file is likely off or too small)" : "");
         return false;
     }
     for (uint64_t p = start / kPage; p < end / kPage; p++) {
@@ -553,6 +565,7 @@ bool heap_decommit(uint64_t offset, uint64_t size) {
     std::lock_guard lk(g_heap_mu);
     if (!g_heap_size) return false;
     if (size == 0) return true;
+    g_ctr_decommits.add(1);
     if (offset > g_heap_size || size > g_heap_size - offset) {
         NXLOG_E(kTag, "heap_decommit: [%llx, +%llx) is outside the section", static_cast<unsigned long long>(offset),
                 static_cast<unsigned long long>(size));
@@ -588,6 +601,11 @@ bool heap_decommit(uint64_t offset, uint64_t size) {
         p = run;
     }
     return true;
+}
+
+uint32_t heap_commit_error() {
+    std::lock_guard lk(g_heap_mu);
+    return g_heap_commit_error;
 }
 
 uint64_t heap_committed() {

@@ -190,7 +190,9 @@ void write_texels(const Target& r, const NVNcopyRegion& g, const uint8_t* src, i
 }
 
 void read_texels(const Target& r, const NVNcopyRegion& g, uint8_t* dst, int64_t row, int64_t image) {
-    gpu::download_texture(r.t);   // false: no GPU image to read back, the storage is read as it is
+    // Only the level and layer read ([nvn] readback_async; a 3D target's slices are one layer). false: no GPU image to read back, the
+    // storage is read as it is.
+    gpu::download_texture(r.t, r.level, 1, r.is3d() ? 0 : r.layer, r.is3d() ? UINT32_MAX : 1);
     if (r.L.block_linear) read_block_linear(r, g, dst, row, image);
     else read_linear(r, g, dst, row, image);
 }
@@ -441,12 +443,19 @@ void nvnTextureFlushTexels(const NVNtexture* texture, const NVNtextureView* view
     gpu::mark_texture_cpu_dirty(t);
 }
 
+// Invalidate reads back the level the view selects (every layer of it; the region is not narrowed), every level without a view.
 void nvnTextureInvalidateTexels(const NVNtexture* texture, const NVNtextureView* view, const NVNcopyRegion* region) {
-    (void)view;
     (void)region;
     Texture* t = tex_of(texture);
     if (!t || !t->mem) return;
-    gpu::download_texture(t);
+    if (!view) {
+        gpu::download_texture(t);
+        return;
+    }
+    const TexLayout L = be::compute_texture_layout(t->b);
+    uint32_t level = 0, layer = 0;
+    if (!L.valid || !select_level_layer(L, view, level, layer)) return;   // a view out of range: nothing (as resolve())
+    gpu::download_texture(t, level, 1);
 }
 
 const NVNmemoryPool* nvnTextureGetMemoryPool(const NVNtexture* texture) {

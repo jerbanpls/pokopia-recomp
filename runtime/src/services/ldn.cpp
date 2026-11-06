@@ -29,6 +29,10 @@
 // pokopia-native (MIT) windows/src/coop/coop_mpnet.c, ACCEPT_WAIT_MS / cmp_host_accepts, @7c3655d).
 // [net] room_code: the lobby's room key (vnet::room_key); a room hosted with one is hidden from players without it. A Connect refused for a
 // wrong code answers ConnectNotFound.
+// Session variant (services_api.h ldnapi): a game module's opt-in gameplay change that every player must share rides in bits 12..14 of the
+// local communication version on the wire (CreateNetwork's room, Connect's JOIN), so the relay's own version check refuses a player whose
+// variant differs. The game sees its own version only (NetworkInfo nodes, GetNetworkConfig). A Connect refused for another variant answers
+// ConnectRejected and logs which side has what; the variant of a room comes from the last Scan that listed it.
 // No lobby ([net] server empty): the state machine runs, Scan finds nothing, Connect answers ConnectNotFound and CreateNetwork
 // DeviceNotAvailable (the answers of the offline stub this replaces).
 #include "ldn.h"
@@ -39,6 +43,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -47,6 +53,7 @@
 
 #include "nxrt/config.h"
 #include "nxrt/log.h"
+#include "nxrt/services_api.h"
 #include "../net/vnet.h"
 #include "services_internal.h"
 
@@ -192,6 +199,39 @@ constexpr int kRoomStateWaitMs = 5000;
 constexpr int kHoldMs = 300;
 constexpr size_t kHoldCap = 32;
 
+// ---- session variant (services_api.h ldnapi) ----------------------------------------------------------------------------------------
+struct Variant {
+    std::mutex mu;
+    uint8_t value = 0;
+    std::string what;
+};
+Variant& variant() {
+    static Variant v;
+    return v;
+}
+uint8_t own_variant(std::string* what = nullptr) {
+    Variant& v = variant();
+    std::lock_guard<std::mutex> lk(v.mu);
+    if (what) *what = v.what;
+    return v.value;
+}
+// The game's version on the wire: its variant in bits 12..14. Only for versions 0..0xfff (the game's own bits never collide); any other is
+// sent as it is (logged once while a variant is set).
+int16_t wire_version(int16_t game) {
+    const uint8_t var = own_variant();
+    if (!var) return game;
+    if (game < 0 || (static_cast<uint16_t>(game) & ~0x0FFFu)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            NXLOG_W("net", "ldn: the game's local communication version 0x%04x uses bits 12..15: the session variant is not sent",
+                    static_cast<uint16_t>(game));
+        return game;
+    }
+    return static_cast<int16_t>(game | (var << ldnapi::kVariantShift));
+}
+int16_t game_version(int16_t wire) { return wire < 0 ? wire : static_cast<int16_t>(wire & ~ldnapi::kVariantMask); }
+uint8_t variant_of(int16_t wire) { return wire < 0 ? 0 : static_cast<uint8_t>((wire & ldnapi::kVariantMask) >> ldnapi::kVariantShift); }
+
 // ---- process lobby ------------------------------------------------------------------------------------------------------------------
 struct LobbySlot {
     std::mutex mu;
@@ -334,7 +374,7 @@ NetworkInfo make_info(const vnet::Room& r, uint8_t accept_policy, uint32_t own_v
         d.node_id = static_cast<int8_t>(n.node_id);
         d.is_connected = 1;
         copy_name(d.user_name, n.vip == own_vip && !own_name.empty() ? own_name : n.nickname);
-        d.local_comm_version = r.comm_version;
+        d.local_comm_version = game_version(r.comm_version);
         ++ni.ldn.node_count;
     }
     const size_t adv = r.adv.size() < sizeof ni.ldn.advertise_data ? r.adv.size() : sizeof ni.ldn.advertise_data;
@@ -447,6 +487,7 @@ private:
     std::array<uint32_t, 8> node_vip_{};  // the node table last seen (0 = empty slot), for the join/leave flags
     std::array<uint8_t, 8> latest_{};    // NodeLatestUpdate flags since the last GetNetworkInfoLatestUpdate
     std::shared_ptr<vnet::HoldLink> hold_;   // host: the current link, in front of the lobby's (see kHoldMs)
+    std::map<uint32_t, int16_t> scan_wire_;  // room id -> its version on the wire as the last Scan listed it (the session variant)
 };
 
 void Ldn::cmd(ipc::Service& s, uint32_t id, const char* name, H h) {
@@ -658,6 +699,10 @@ uint32_t Ldn::scan(ipc::Request& req, ipc::Response& rsp) {
         const uint16_t scene = (f.flag & kFilterSceneId) ? f.id.intent.scene_id : 0xFFFF;
         const int e = lobby->scan(lcid, scene, &rooms);
         if (e) NXLOG_D("net", "ldn: scan failed: %s", vnet::lobby_err_str(e));
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (const vnet::Room& r : rooms) scan_wire_[r.room_id] = r.comm_version;
+        }
         for (const vnet::Room& r : rooms) {
             if (count >= cap) break;
             if (r.room_id == own_room) continue;
@@ -727,7 +772,7 @@ uint32_t Ldn::create(const SecurityConfig& sec, const UserConfig& user, const Ne
         lobby = lobby_;
         rc.local_comm_id = cfg.intent.local_comm_id;
         rc.scene_id = cfg.intent.scene_id;
-        rc.comm_version = static_cast<int16_t>(cfg.local_comm_version);
+        rc.comm_version = wire_version(static_cast<int16_t>(cfg.local_comm_version));
         rc.node_count_max = cfg.node_count_max;
         rc.security_mode = static_cast<uint8_t>(sec.mode);
         rc.pass_hash = vnet::passphrase_hash(sec.passphrase, sec.passphrase_size);
@@ -763,7 +808,11 @@ uint32_t Ldn::create(const SecurityConfig& sec, const UserConfig& user, const Ne
     hold_ = std::make_shared<vnet::HoldLink>(lobby->link(), kHoldMs, kHoldCap);
     apply_room(r);
     vnet::set_current_link(hold_);
-    NXLOG_I("net", "ldn: created room %u as %s", room_id_, vnet::ip_str(vip_).c_str());
+    std::string what;
+    if (const uint8_t var = variant_of(rc.comm_version); var && own_variant(&what) == var)
+        NXLOG_I("net", "ldn: created room %u as %s with %s (session variant %u: only players with it can join)", room_id_,
+                vnet::ip_str(vip_).c_str(), what.c_str(), var);
+    else NXLOG_I("net", "ldn: created room %u as %s", room_id_, vnet::ip_str(vip_).c_str());
     set_state(kAccessPointCreated);
     return 0;
 }
@@ -871,9 +920,29 @@ uint32_t Ldn::join(uint32_t room_id, int16_t room_version, const SecurityConfig&
     }
     if (room_id == 0) return kConnectNotFound;
     vnet::Joined j;
-    const int e = lobby->join(room_id, static_cast<int16_t>(version), vnet::passphrase_hash(sec.passphrase, sec.passphrase_size), &j);
+    const int16_t wire = wire_version(static_cast<int16_t>(version));
+    const int e = lobby->join(room_id, wire, vnet::passphrase_hash(sec.passphrase, sec.passphrase_size), &j);
     if (e) {
         NXLOG_I("net", "ldn: Connect to room %u failed: %s", room_id, vnet::lobby_err_str(e));
+        if (e == vnet::kLobbyVersion) {
+            int16_t room_wire = room_version;
+            bool known = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                const auto it = scan_wire_.find(room_id);
+                if (it != scan_wire_.end()) room_wire = it->second, known = true;
+            }
+            std::string what;
+            const uint8_t mine = own_variant(&what), theirs = variant_of(room_wire);
+            if (known && mine != theirs && game_version(room_wire) == game_version(wire)) {
+                // the same game, another session variant: every player needs the same setting
+                const char* name = what.empty() ? "a gameplay setting" : what.c_str();
+                if (mine && theirs) NXLOG_W("net", "ldn: Connect to room %u refused: its session variant is %u, this PC's %u (%s)", room_id, theirs, mine, name);
+                else if (mine) NXLOG_W("net", "ldn: Connect to room %u refused: the host has %s off, this PC has it on. Every player of a session needs the same setting", room_id, name);
+                else NXLOG_W("net", "ldn: Connect to room %u refused: the host has %s on (session variant %u), this PC has it off. Every player of a session needs the same setting", room_id, name, theirs);
+                return kConnectRejected;
+            }
+        }
         switch (e) {
             case vnet::kLobbyNoRoom:
             case vnet::kLobbyRoomCode: return kConnectNotFound;   // a room with another code: as if it were not there
@@ -1022,7 +1091,19 @@ void ldn_reset() {
         old.swap(s.lobby);
         s.built = false;
     }
+    ldnapi::set_session_variant(0, "");
     // old goes away here (a relay client closes its connection)
 }
+
+namespace ldnapi {
+void set_session_variant(uint8_t v, const char* what) {
+    v &= kVariantMask >> kVariantShift;
+    Variant& s = variant();
+    std::lock_guard<std::mutex> lk(s.mu);
+    s.value = v;
+    s.what = what ? what : "";
+}
+uint8_t session_variant() { return own_variant(); }
+}  // namespace ldnapi
 
 }  // namespace nxrt::services

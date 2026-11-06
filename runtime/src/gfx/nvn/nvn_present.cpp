@@ -13,6 +13,7 @@
 #include "extras/output_pass.h"
 #include "nxrt/frame_limiter.h"
 #include "nxrt/gauge.h"
+#include "nxrt/gfx_tuning.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/log.h"
 #include "nvn_gpu_internal.h"
@@ -75,11 +76,20 @@ void present_on_render_thread(Window* w, int index, bool again) {
     if (!rend || !pp) return;
     { NXFT("present.tex"); if (!tex_gpu(t)) return; }
     extras::pace_note_present();
+    // [nvn] one_submit: batch flushes the worker has not started yet ride in this present's submission instead of a kernel submission of
+    // their own; whatever is still taken when this function ends without submitting goes back to the worker
+    present_take_parked();
+    struct GiveBack { ~GiveBack() { present_give_back(); } } give_back;
     submit_drain();     // [nvn] submit_thread: the previous present has run (swapchain, frame slot fence, `dirty`) before the hook and begin_frame
     if (FrameLimiter* lim = limiter()) {
         // the pre-frame hook (present mode changes) always runs here; the wait runs here only when no frame boundary has paced this present (S18)
         { NXFT("present.hook"); lim->run_pre_frame_hook(); }
-        if (!(extras::pace_in_main() && extras::pace_boundary_consume())) { NXFT("limiter"); nxrt::HitchTimer ht(nxrt::kHpRenderLimiter); lim->begin_frame_nohook(); }
+        if (!(extras::pace_in_main() && extras::pace_boundary_consume())) {
+            present_give_back();    // [nvn] one_submit: not held back by the limiter's wait
+            NXFT("limiter");
+            nxrt::HitchTimer ht(nxrt::kHpRenderLimiter);
+            lim->begin_frame_nohook();
+        }
     }
     if (!again) {
         const int64_t n = static_cast<int64_t>(counters().presents.load());
@@ -106,6 +116,13 @@ void present_on_render_thread(Window* w, int index, bool again) {
     int32_t crop[4] = {w->crop[0], w->crop[1], w->crop[2], w->crop[3]};
     if (const float sc = tex_scale(t); sc != 1.0f)
         for (int32_t& c : crop) c = static_cast<int32_t>(std::lround(static_cast<float>(c) * sc));
+    {   // for the F1 page: the rendered size that reaches the output stage, and the size it is shown at (crop {x, y, w, h}; 0 = the whole texture)
+        nxrt::gfx::Tuning& tu = nxrt::gfx::tuning();
+        tu.present_src_w.store(crop[2] > 0 ? crop[2] : static_cast<int>(e.width), std::memory_order_relaxed);
+        tu.present_src_h.store(crop[3] > 0 ? crop[3] : static_cast<int>(e.height), std::memory_order_relaxed);
+        tu.present_out_w.store(static_cast<int>(fi.extent.width), std::memory_order_relaxed);
+        tu.present_out_h.store(static_cast<int>(fi.extent.height), std::memory_order_relaxed);
+    }
     pp->set_flip_y(window_origin_mode() == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT);   // the game runs with the lower-left origin (mode 0)
     // HDR scene / HDR swapchain / FSR 1 or NIS / picture controls go through the output pass (S14); everything else is the plain present pass of the SDR path
     const extras::HdrState hs = extras::hdr_state();

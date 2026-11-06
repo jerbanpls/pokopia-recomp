@@ -50,6 +50,9 @@ constexpr size_t kRestBytes = offsetof(GraphicsKey, tess) - kStageBytes;   // th
 static_assert(offsetof(GraphicsKey, stage) == 0, "the shader pointers come first in GraphicsKey");
 static_assert(offsetof(GraphicsKey, color_format) == kStageBytes, "the plain key bytes follow the shader pointers");
 constexpr size_t kMaxRecords = 400000;
+// A compute record ([nvn] compute_prewarm): h[0] = this tag, h[1] = the compute shader's hash, h[2] = compute_layout_key, rest zero. A build
+// without compute records reads the tag as a vertex hash the shader cache does not have, so its stand-in fails and the record is skipped.
+constexpr uint64_t kComputeTag = 0xC5C5C5C5C5C5C5C5ull;
 
 struct Rec {
     uint64_t h[3];                          // code hashes of vertex, fragment, geometry (0 = stage absent)
@@ -62,6 +65,7 @@ struct Job {
     uint64_t digest = 0;
     int state = 0;                          // 0 queued, 1 building, 2 done, 3 taken over by a draw (the worker skips it)
     bool in_queue = false, promoted = false;
+    bool compute = false;                   // a compute record: built into the compute pipelines (compute_build_ahead), pipe unused
     VkPipeline pipe = VK_NULL_HANDLE;
     std::shared_ptr<PipeUpgrade> up;        // a draw linked the key from parts meanwhile: the whole pipeline goes here and replaces that one
 };
@@ -71,6 +75,7 @@ std::condition_variable g_cv;
 bool g_inited = false, g_enabled = true, g_stop = false;
 std::string g_path;
 std::vector<Rec> g_recs;
+std::vector<Rec> g_cs_recs;                                  // compute records (kComputeTag), kept apart from the graphics ones
 std::vector<std::shared_ptr<Job>> g_rec_jobs;                // by index in g_recs (null: recorded this session, built at its draw)
 // Programs of one stage each (Pokopia binds a vertex program and a fragment program separately): a record is found by any of its stages.
 std::unordered_multimap<uint64_t, size_t> g_by_any;          // any stage's hash -> index in g_recs
@@ -164,13 +169,17 @@ void load_file() {
         return;
     }
     Rec r;
-    while (g_recs.size() < kMaxRecords && f.read(reinterpret_cast<char*>(&r), sizeof r)) {
+    while (g_recs.size() + g_cs_recs.size() < kMaxRecords && f.read(reinterpret_cast<char*>(&r), sizeof r)) {
         if (!g_digests.insert(digest_of(r.h, r.rest)).second) continue;
+        if (r.h[0] == kComputeTag) {
+            g_cs_recs.push_back(r);
+            continue;
+        }
         for (uint64_t h : r.h)
             if (h) g_by_any.emplace(h, g_recs.size());
         g_recs.push_back(r);
     }
-    g_stats.loaded = g_recs.size();
+    g_stats.loaded = g_recs.size() + g_cs_recs.size();
 }
 
 void append_record(const Rec& r) {
@@ -204,6 +213,21 @@ void worker_main() {
             if (j->state != 0) continue;       // built already (it was moved ahead) or a draw took it over
             j->state = 1;
         }
+        if (j->compute) {                      // into the compute pipelines; a dispatch finds it by shader content and layout
+            bool ok = false;
+            {
+                NXFT("prewarm.build");
+                const ShaderInfo* cs = shader_cache().is_open() ? shader_cache().load_stub(hex16(j->rec.h[1])) : nullptr;
+                ok = cs && compute_build_ahead(cs, j->rec.h[2]);
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                j->state = 2;
+                if (ok) ++g_stats.built; else ++g_stats.failed;
+            }
+            g_cv.notify_all();
+            continue;
+        }
         VkPipeline p = VK_NULL_HANDLE;
         {
             NXFT("prewarm.build");
@@ -229,26 +253,43 @@ void worker_main() {
 
 // The summary line every 30 s: what was deferred, built at the draw and built in the background since the last one (session totals in brackets).
 void log_summary_locked() {
-    struct Snap { uint64_t deferred = 0, linked = 0, whole_draw = 0, whole_bg = 0, parts_bg = 0, upgrades = 0; };
+    struct Snap {
+        uint64_t deferred = 0, deferred_busy = 0, linked = 0, whole_draw = 0, whole_bg = 0, parts_bg = 0, upgrades = 0, aw_skipped = 0, aw_built = 0;
+        uint64_t cs_skipped = 0, cs_dispatch = 0, cs_prewarmed = 0, cs_bg = 0;
+    };
     static Snap last;
     const GplStats g = gpl_stats();
+    const ComputeStats cs = compute_stats();
     Snap now;
     now.deferred = g.draws_deferred;
+    now.deferred_busy = g.draws_deferred_in_flight;
+    now.cs_skipped = cs.skipped;
+    now.cs_dispatch = cs.at_dispatch;
+    now.cs_prewarmed = cs.prewarmed;
+    now.cs_bg = cs.background;
     now.linked = g.linked;
     now.whole_draw = pipelines_built_at_draw();
     now.whole_bg = g_stats.built;
     now.parts_bg = g.parts_ahead;
     now.upgrades = g.upgrades_done;
+    now.aw_skipped = draws_skipped_async();
+    now.aw_built = pipelines_built_async();
     size_t waiting = 0;
     for (const auto& j : g_rec_jobs)
         if (j && j->state <= 1) ++waiting;
     auto d = [](uint64_t a, uint64_t b) { return static_cast<unsigned long long>(a - b); };
     auto u = [](uint64_t a) { return static_cast<unsigned long long>(a); };
-    NXLOG_I("nvn.pipe", "pipelines, last 30 s (session): draws deferred %llu (%llu), linked at the draw %llu (%llu), built whole at the draw %llu (%llu); "
-                        "background builds %llu (%llu): whole %llu, parts %llu, upgrades %llu; keys known %zu (%llu from the file, %llu new), %zu still to build",
-            d(now.deferred, last.deferred), u(now.deferred), d(now.linked, last.linked), u(now.linked), d(now.whole_draw, last.whole_draw), u(now.whole_draw),
+    NXLOG_I("nvn.pipe", "pipelines, last 30 s (session): draws deferred %llu (%llu), deferred (parts in progress) %llu (%llu), linked at the draw %llu (%llu), "
+                        "built whole at the draw %llu (%llu); background builds %llu (%llu): whole %llu, parts %llu, upgrades %llu; "
+                        "async_whole: draws skipped %llu (%llu), built %llu (%llu); compute: skipped %llu (%llu), built at the dispatch %llu (%llu), "
+                        "prewarmed %llu (%llu), built in the background %llu (%llu); keys known %zu (%llu from the file, %llu new), %zu still to build",
+            d(now.deferred, last.deferred), u(now.deferred), d(now.deferred_busy, last.deferred_busy), u(now.deferred_busy),
+            d(now.linked, last.linked), u(now.linked), d(now.whole_draw, last.whole_draw), u(now.whole_draw),
             d(now.whole_bg + now.parts_bg + now.upgrades, last.whole_bg + last.parts_bg + last.upgrades), u(now.whole_bg + now.parts_bg + now.upgrades),
-            d(now.whole_bg, last.whole_bg), d(now.parts_bg, last.parts_bg), d(now.upgrades, last.upgrades), g_recs.size(), u(g_stats.loaded), u(g_stats.recorded),
+            d(now.whole_bg, last.whole_bg), d(now.parts_bg, last.parts_bg), d(now.upgrades, last.upgrades), d(now.aw_skipped, last.aw_skipped),
+            u(now.aw_skipped), d(now.aw_built, last.aw_built), u(now.aw_built), d(now.cs_skipped, last.cs_skipped), u(now.cs_skipped),
+            d(now.cs_dispatch, last.cs_dispatch), u(now.cs_dispatch), d(now.cs_prewarmed, last.cs_prewarmed), u(now.cs_prewarmed),
+            d(now.cs_bg, last.cs_bg), u(now.cs_bg), g_recs.size() + g_cs_recs.size(), u(g_stats.loaded), u(g_stats.recorded),
             waiting);
     last = now;
 }
@@ -317,11 +358,24 @@ void prewarm_init() {
             }
         }
         g_stats.queued = boot ? g_recs.size() : 0;
+        // [nvn] compute_prewarm: the compute records first in line (a few dozen, each far cheaper than a graphics pipeline); not tied to
+        // prewarm_boot, since no program set promotes them later
+        if (compute_prewarm_on()) {
+            for (auto it = g_cs_recs.rbegin(); it != g_cs_recs.rend(); ++it) {
+                auto j = std::make_shared<Job>();
+                j->rec = *it;
+                j->compute = true;
+                j->in_queue = true;
+                g_queue.push_front(j);            // reverse walk + push_front: file order at the front
+            }
+            g_stats.queued += g_cs_recs.size();
+        }
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
         const int64_t want = config_get_int("nvn", "prewarm_threads", std::clamp<int64_t>(hw / 6, 1, 4));
         for (int64_t i = 0; i < want; ++i) g_workers.emplace_back(worker_main);
         g_saver = std::thread(saver_main);
-        NXLOG_I(kTag, "prewarm: %zu recorded pipelines from %s, %zu worker threads; %s", g_recs.size(), g_path.c_str(), g_workers.size(),
+        NXLOG_I(kTag, "prewarm: %zu recorded pipelines (+%zu compute%s) from %s, %zu worker threads; %s", g_recs.size(), g_cs_recs.size(),
+                compute_prewarm_on() ? ", first in line" : ", not built: [nvn] compute_prewarm is false", g_path.c_str(), g_workers.size(),
                 boot ? "all queued from boot, in the order they were first used" : "each queued when the game sets one of its shaders ([nvn] prewarm_boot is false)");
     }
     for (const Rec& r : parts) queue_parts(r, false);           // outside g_mu: the pipeline-library side takes its own lock
@@ -335,6 +389,23 @@ void prewarm_record(const GraphicsKey& key) {
     if (g_recs.size() >= kMaxRecords || !g_digests.insert(digest_of(r.h, r.rest)).second) return;
     g_recs.push_back(r);
     g_rec_jobs.push_back(nullptr);                              // built or linked at its draw this session
+    ++g_stats.recorded;
+    append_record(r);
+}
+
+void prewarm_record_compute(const ShaderInfo* cs, uint64_t layout_key) {
+    if (!cs || !compute_prewarm_on()) return;
+    Rec r;
+    std::memset(&r, 0, sizeof r);
+    r.h[0] = kComputeTag;
+    r.h[1] = parse_hash(cs->hash);
+    r.h[2] = layout_key;
+    if (!r.h[1]) return;                                        // no cache hash: a stand-in could not be found next run
+    prewarm_init();
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_enabled) return;
+    if (g_recs.size() + g_cs_recs.size() >= kMaxRecords || !g_digests.insert(digest_of(r.h, r.rest)).second) return;
+    g_cs_recs.push_back(r);
     ++g_stats.recorded;
     append_record(r);
 }
@@ -370,7 +441,8 @@ size_t prewarm_program(const ShaderInfo* const stages[6]) {
     return ahead.size();
 }
 
-bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later) {
+bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later,
+                  bool no_wait) {
     Rec want;
     if (!rec_of(key, &want)) return false;
     const uint64_t digest = digest_of(want.h, want.rest);
@@ -408,6 +480,17 @@ bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<b
                 ++g_stats.linked_meanwhile;
                 return false;
             }
+        }
+        if (no_wait && later) {                                  // [nvn] async_whole: the draw is skipped, the worker's build fills *later
+            j->up = std::make_shared<PipeUpgrade>();
+            *later = j->up;
+            erase_job_locked(j);
+            if (j->state == 0) {                                 // still queued: first in line
+                g_queue.push_front(j);
+                g_cv.notify_all();
+            }
+            ++g_stats.no_wait;
+            return false;
         }
         if (j->state == 0) {                                     // still queued: build it here instead of behind the others
             j->state = 3;
@@ -454,6 +537,7 @@ void prewarm_shutdown() {
     g_inited = false;
     g_stats = PrewarmStats{};
     g_recs.clear();
+    g_cs_recs.clear();
     g_rec_jobs.clear();
     g_by_any.clear();
     g_digests.clear();
@@ -468,6 +552,7 @@ PrewarmStats prewarm_stats() {
 // their shader parts queued by the pipeline-library side when the key file has nothing for them.
 void prewarm_program_shaders(const ShaderInfo* const stages[6]) {
     gpl_program(stages, prewarm_program(stages) != 0);
+    if (stages && stages[5]) compute_program_set(stages[5]);    // [nvn] async_compute: its pipeline is built in the background now
 }
 
 void flush_caches() { pipeline_cache_flush(); }

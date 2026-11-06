@@ -68,6 +68,8 @@ pub type LogFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 pub struct Job {
     pub game_dir: PathBuf,
     pub romfs: PathBuf,
+    /// The base game's romfs layered under `romfs` (an update dumped without the base game's files under it); None: romfs alone.
+    pub romfs_base: Option<PathBuf>,
     pub main: PathBuf,
     pub jobs: usize,
     /// "Gentle build": the tools run at idle priority (the default is below normal).
@@ -75,6 +77,17 @@ pub struct Job {
     pub log: Option<LogFn>,
     /// Test runs: translate at most this many blocks (0 = all); the setup is then never marked complete.
     pub limit: usize,
+}
+
+impl Job {
+    /// What the marker records as the extracted romfs: the romfs, and the base romfs under it when there is one.
+    pub fn romfs_key(&self) -> String {
+        let f = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        match &self.romfs_base {
+            Some(b) => format!("{} over {}", f(&self.romfs), f(b)),
+            None => f(&self.romfs),
+        }
+    }
 }
 
 pub fn cache_dir(game_dir: &Path) -> PathBuf {
@@ -399,7 +412,7 @@ pub fn run(job: &Job, tools: &Tools, cancel: &AtomicBool, mut report: impl FnMut
     let stage = cache.join("stage");
     let spirv = job.game_dir.join(SPIRV_REL);
     fs::create_dir_all(&spirv).map_err(|e| format!("cannot create {}: {}", spirv.display(), e))?;
-    let romfs_s = job.romfs.to_string_lossy().replace('\\', "/");
+    let romfs_s = job.romfs_key();
     let mut marker = read_marker(&job.game_dir);
     if marker.romfs != romfs_s {
         marker = Marker { romfs: romfs_s.clone(), ..Default::default() };
@@ -416,6 +429,9 @@ pub fn run(job: &Job, tools: &Tools, cancel: &AtomicBool, mut report: impl FnMut
         let _ = fs::remove_file(corpus.join("unique.tsv"));
         let mut cmd = crate::host::command(&tools.python);
         cmd.arg("-I").arg(&tools.extract).arg("--romfs").arg(&job.romfs).arg("--main").arg(&job.main).arg("--out").arg(&corpus);
+        if let Some(b) = &job.romfs_base {
+            cmd.arg("--romfs-base").arg(b);
+        }
         cmd.args(["--jobs", &jobs, "--progress"]);
         let ok = run_tool(cmd, cancel, job.idle, job.log.as_ref(), None, |l| {
             if let Some(rest) = l.strip_prefix("scan: ") {

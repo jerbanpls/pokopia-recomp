@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Display options of play mode (S10): internal resolution, aspect ratio, field of view, dynamic resolution, filtering and post effects.
 //
-// Two halves. This one (no game, no host state) is the arithmetic every option reduces to and is covered by unit tests, plus the renderer
+// Two halves. This one (no game, no host state) is the arithmetic every option reduces to, plus the renderer
 // tuning (anisotropy, LOD bias) that applies to every game. The other half applies the options to one game's own objects through hooks
 // and belongs to the game module (Metroid Prime Remastered: games/mpr/display_hooks.h); play mode reaches it through GamePlay
 // (play_game.h: install_render, settings_changed, display_live).

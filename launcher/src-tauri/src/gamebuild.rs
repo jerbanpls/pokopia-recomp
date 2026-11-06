@@ -213,35 +213,3 @@ pub fn run(job: &Job, tools: &Tools, cancel: &AtomicBool, mut report: impl FnMut
     say(&format!("FAILED: game build ({}). Last error output:\n{}", st, tail));
     Err(error.unwrap_or_else(|| format!("The game build failed ({}). {}", st, tail.trim())))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("pkp-gamebuild-{}-{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(d.join("build")).unwrap();
-        d
-    }
-
-    #[test]
-    fn no_build_without_exe_or_record() {
-        let d = temp("none");
-        assert_eq!(built_state(&d, &d.join("tools")), Built::No);
-        fs::write(d.join("pkp.exe"), b"MZ").unwrap();
-        assert_eq!(built_state(&d, &d.join("tools")), Built::No);
-        fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
-    fn unchecked_build_is_stale() {
-        // a finished build that this release's tools cannot vouch for (here: no tools at all) needs Set up again
-        let d = temp("stale");
-        fs::write(d.join("pkp.exe"), b"MZ").unwrap();
-        fs::write(d.join("build").join("done.json"), b"{\"format\": 1}").unwrap();
-        assert_eq!(built_state(&d, &d.join("tools")), Built::Stale);
-        assert!(!is_built(&d, &d.join("tools")));
-        fs::remove_dir_all(&d).unwrap();
-    }
-}

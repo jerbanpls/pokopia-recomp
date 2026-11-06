@@ -172,16 +172,27 @@ std::string pad_pack_name(PromptStyle style, const PadSettings& pad, bool label_
     if (style != PromptStyle::Xbox && style != PromptStyle::PlayStation) return {};
     if (switch_bit == 0 || (switch_bit & (switch_bit - 1)) != 0) return {};   // exactly one button bit
     using namespace hid;
+    // one d-pad direction: the cross with that arm lit (the prompt names a direction); pad_pack_fallback() gives the whole cross
+    const char* dir = switch_bit == btn(kBtnUp) ? "_up" : switch_bit == btn(kBtnDown) ? "_down" : switch_bit == btn(kBtnLeft) ? "_left"
+                    : switch_bit == btn(kBtnRight) ? "_right" : nullptr;
+    if (dir) return std::string(pad_name(style, pad, label_abxy, Btn::DPad)) + dir;
     Btn b = Btn::None;
-    if (switch_bit & (btn(kBtnLeft) | btn(kBtnUp) | btn(kBtnRight) | btn(kBtnDown))) b = Btn::DPad;
-    else
-        for (int i = 0; i < static_cast<int>(Btn::kCount); ++i)
-            if (button_bit(static_cast<Btn>(i)) == switch_bit) {
-                b = static_cast<Btn>(i);
-                break;
-            }
+    for (int i = 0; i < static_cast<int>(Btn::kCount); ++i)
+        if (button_bit(static_cast<Btn>(i)) == switch_bit) {
+            b = static_cast<Btn>(i);
+            break;
+        }
     if (b == Btn::None) return {};
     return pad_name(style, pad, label_abxy, b);
+}
+
+std::string pad_pack_fallback(const std::string& name) {
+    for (const std::string dir : {"_up", "_down", "_left", "_right"}) {
+        const std::string tail = "/dpad" + dir;
+        if (name.size() > tail.size() && name.compare(name.size() - tail.size(), tail.size(), tail) == 0)
+            return name.substr(0, name.size() - dir.size());
+    }
+    return {};
 }
 
 PromptStyle auto_style(LastDevice last, int last_pad_kind, int connected_pad_kind) {

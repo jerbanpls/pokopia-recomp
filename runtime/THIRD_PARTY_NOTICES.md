@@ -70,15 +70,15 @@ The nxrt parts that come from smo-recomp and ScarletNX are under GPL-3.0, like n
 
 ## LLVM libc++abi (Apache-2.0 with LLVM exceptions)
 
-`src/eh/typeinfo.cpp`, `src/eh/unwind.cpp`, `include/nxrt/eh.h` and `tests/lift/guest/rt2.h` follow the behaviour and data layouts of LLVM libc++abi (`libcxxabi/src/private_typeinfo.cpp`, `cxa_exception.h`, `cxa_exception.cpp`, `cxa_personality.cpp`), read from the llvm-project repository on 2026-10-21. The code was written from that behaviour and from the Itanium C++ ABI; no libc++abi source text was copied. Licence of the upstream files: Apache License v2.0 with LLVM Exceptions (https://llvm.org/LICENSE.txt), which is compatible with GPL-3.0-or-later for this use. The licence text in the release is `licenses/LICENSE.libcxxabi.Apache-2.0-LLVM-exception.txt` (source: `tools/release/licenses/`).
+`src/eh/typeinfo.cpp`, `src/eh/unwind.cpp` and `include/nxrt/eh.h` follow the behaviour and data layouts of LLVM libc++abi (`libcxxabi/src/private_typeinfo.cpp`, `cxa_exception.h`, `cxa_exception.cpp`, `cxa_personality.cpp`), read from the llvm-project repository on 2026-10-21. The code was written from that behaviour and from the Itanium C++ ABI; no libc++abi source text was copied. Licence of the upstream files: Apache License v2.0 with LLVM Exceptions (https://llvm.org/LICENSE.txt), which is compatible with GPL-3.0-or-later for this use. The licence text in the release is `licenses/LICENSE.libcxxabi.Apache-2.0-LLVM-exception.txt` (source: `tools/release/licenses/`).
 
 ## recomp `oracle/e2e/rt/eh_rt.cpp` (GPL-3.0-or-later, S1)
 
-`src/eh/unwind.cpp` and `src/eh/catch_call.cpp` rework the table walk and landing protocol of this test-only runtime (S1, same project, same licence). `tests/tools/guest_build.py` and `tests/tools/unicorn_expect.py` import S1's `build_prog.py` and `unicorn_side.py` from `../recomp/oracle/e2e` at build time without copying them.
+`src/eh/unwind.cpp` and `src/eh/catch_call.cpp` rework the table walk and landing protocol of this test-only runtime (S1, same project, same licence; the file itself has since been removed).
 
 ## libnx (ISC)
 
-`tests/tools/gen_hipc_vectors.py` re-implements the message packing of libnx `sf/hipc.h` and `sf/cmif.h` to produce independent test vectors. libnx is distributed under this licence:
+Service layouts in `src/services` follow libnx headers and sources (for example `nx/source/services/bsd.c`). libnx is distributed under this licence:
 
 ```
 Copyright 2017-2018 libnx Authors

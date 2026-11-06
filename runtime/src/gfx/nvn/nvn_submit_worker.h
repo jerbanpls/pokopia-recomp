@@ -10,7 +10,7 @@
 //   (wait_submitted), then on the timeline: no host wait ever starts on a value nobody has handed to the queue yet.
 // - drain(): returns once every job pushed before the call has run (the queue is empty and the worker idle). Swapchain work (acquire,
 //   recreate, present mode change), sparse binds, the debug wait-idle submit and shutdown drain first.
-// No Vulkan in here (unit test: tests/gfx/test_nvn_submit_worker.cpp).
+// No Vulkan in here.
 #pragma once
 
 #include <algorithm>

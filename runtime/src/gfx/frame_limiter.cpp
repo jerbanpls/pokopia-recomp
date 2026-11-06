@@ -288,4 +288,15 @@ double suggest_vrr_cap(double refresh_hz) {
     return cap < 1.0 ? 1.0 : cap;
 }
 
+FrameSnap snap_frame_cap(double cap, double hz) {
+    FrameSnap r;
+    r.cap = cap;
+    if (!(hz > 0) || !(cap > 0) || cap >= hz) return r;
+    const int k = static_cast<int>(std::ceil(hz / (cap * 1.005)));
+    if (k < 2) return r;
+    r.k = k;
+    r.cap = hz / k;
+    return r;
+}
+
 }  // namespace nxrt

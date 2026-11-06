@@ -4,7 +4,7 @@
 //
 //   Link            one node's attachment: send() a datagram out, inbound datagrams go to the receiver set on it (any thread).
 //   LoopbackHub     an in-process switch: N links, unicast by dst_ip, x.y.z.255 copied to every other link of the same /24
-//                   (never back to the sender). Unit tests, and two virtual nodes in one process.
+//                   (never back to the sender). Two virtual nodes in one process.
 //   current link    the process-wide link the bsd socket table uses (vsock::stack()). ldn sets it on connect and clears it on
 //                   disconnect (phase 2); no link = the sockets answer ENETUNREACH, as a console with no network up does.
 //

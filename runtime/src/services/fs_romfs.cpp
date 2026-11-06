@@ -110,6 +110,7 @@ struct Node {
     uint32_t first_child = kNone;  // directories: first subdirectory entry
     uint32_t first_file = kNone;   // directories: first file entry
     uint64_t data = 0;           // files: offset of the data from the partition start
+    bool from_base = false;      // served from the base layer (make_layout's base_dir)
 };
 
 std::string shown(const Node& n) { return n.path.empty() ? std::string("/") : n.path; }
@@ -260,8 +261,8 @@ struct Layout {
     std::map<std::string, uint32_t> by_path;
 };
 
-// Lays out the host folder: entries sorted by full path in each table, file data in that order, 16-byte aligned.
-bool make_layout(const std::string& host_dir, Layout& L, std::string* err) {
+// Scans a host folder (or a .nup's RomFS) into root. False with *err set.
+bool scan_root(const std::string& host_dir, Node& root, std::string* err) {
     std::string msg;
     std::wstring wdir;
     const bool packaged = nup::is_nup(host_dir);
@@ -275,12 +276,54 @@ bool make_layout(const std::string& host_dir, Layout& L, std::string* err) {
         if (err) *err = "not a folder: " + host_dir;
         return false;
     }
-    Node root;
     root.is_dir = true;
     root.host = long_path(abs.wstring());
     if (!(packaged ? scan_nup(host_dir, root, msg) : scan(root, msg))) {
         if (err) *err = msg;
         return false;
+    }
+    return true;
+}
+
+void mark_base(Node& n) {
+    n.from_base = true;
+    for (Node& k : n.kids) mark_base(k);
+}
+
+// Puts every entry of `base` that `top` lacks under `top` (the files of `top` win; a folder in both is merged). False with msg set when one
+// layer has a file where the other has a folder: such a pair cannot be layered.
+bool overlay(Node& top, Node&& base, std::string& msg) {
+    for (Node& b : base.kids) {
+        auto it = std::find_if(top.kids.begin(), top.kids.end(), [&](const Node& k) { return k.name == b.name; });
+        if (it == top.kids.end()) {
+            mark_base(b);
+            top.kids.push_back(std::move(b));
+        } else if (it->is_dir != b.is_dir) {
+            msg = "the update and the base game disagree on " + b.path + " (a file in one, a folder in the other)";
+            return false;
+        } else if (it->is_dir && !overlay(*it, std::move(b), msg)) {
+            return false;
+        }
+    }
+    std::sort(top.kids.begin(), top.kids.end(), [](const Node& a, const Node& b) { return a.name < b.name; });
+    return true;
+}
+
+// Lays out the host folder: entries sorted by full path in each table, file data in that order, 16-byte aligned.
+bool make_layout(const std::string& host_dir, const std::string& base_dir, Layout& L, std::string* err) {
+    Node root;
+    if (!scan_root(host_dir, root, err)) return false;
+    if (!base_dir.empty()) {
+        Node base;
+        std::string e;
+        if (!scan_root(base_dir, base, &e)) {
+            if (err) *err = "base game RomFS: " + e;
+            return false;
+        }
+        if (!overlay(root, std::move(base), e)) {
+            if (err) *err = e;
+            return false;
+        }
     }
 
     std::vector<Node*> dirs{&root}, files;
@@ -392,7 +435,9 @@ bool make_layout(const std::string& host_dir, Layout& L, std::string* err) {
     L.segs.push_back({kHeaderSize, kPartitionOfs - kHeaderSize, Segment::Kind::kZero, 0, 0});
     uint64_t cursor = kPartitionOfs;
     uint64_t data_bytes = 0;
+    uint32_t base_files = 0;
     for (Node* f : files) {
+        if (f->from_base) base_files++;
         const uint64_t img = kPartitionOfs + f->data;
         if (img > cursor) L.segs.push_back({cursor, img - cursor, Segment::Kind::kZero, 0, 0});
         const uint32_t idx = static_cast<uint32_t>(L.files.size());
@@ -410,6 +455,7 @@ bool make_layout(const std::string& host_dir, Layout& L, std::string* err) {
     L.stats.dirs = static_cast<uint32_t>(dirs.size());
     L.stats.data_bytes = data_bytes;
     L.stats.data_offset = kPartitionOfs;
+    L.stats.base_files = base_files;
     L.built = true;
     return true;
 }
@@ -499,9 +545,9 @@ struct RomfsImage::Impl {
 RomfsImage::RomfsImage() : p_(std::make_unique<Impl>()) {}
 RomfsImage::~RomfsImage() = default;
 
-bool RomfsImage::build(const std::string& host_dir, std::string* err) {
+bool RomfsImage::build(const std::string& host_dir, std::string* err, const std::string& base_dir) {
     Layout fresh;
-    const bool ok = make_layout(host_dir, fresh, err);
+    const bool ok = make_layout(host_dir, base_dir, fresh, err);
     std::lock_guard<std::mutex> lk(p_->mu);
     p_->cache.clear();
     p_->l = ok ? std::move(fresh) : Layout{};

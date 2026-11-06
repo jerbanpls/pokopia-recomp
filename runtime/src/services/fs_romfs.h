@@ -22,7 +22,10 @@ public:
     // Scans `host_dir` (recursively; names are taken as UTF-8 from the host paths) and builds the tables. `host_dir` may also name a .nup
     // package (nxrt/nup.h): its RomFS is served from the package file. False with *err set when the
     // folder does not exist or an entry cannot be described. Replaces an earlier build.
-    bool build(const std::string& host_dir, std::string* err = nullptr);
+    // `base_dir` (optional, a folder or a .nup): a lower layer. Every file and folder of it that `host_dir` lacks is served too, as a
+    // console patch over its base game: the files of `host_dir` win. For an update dumped without the base game's files under it (an
+    // update only holds the files it changes; fork #128).
+    bool build(const std::string& host_dir, std::string* err = nullptr, const std::string& base_dir = std::string());
     bool built() const;
     uint64_t size() const;                                  // total image size in bytes
     // Copies [offset, offset + len) of the image into dst. False when the range is outside the image or a host file cannot be read
@@ -32,6 +35,7 @@ public:
         uint32_t files = 0, dirs = 0;                       // dirs counts the root
         uint64_t data_bytes = 0;                            // sum of file sizes
         uint64_t data_offset = 0;                           // header.file_partition_ofs
+        uint32_t base_files = 0;                            // files served from the base layer (build's base_dir)
     };
     Stats stats() const;
     // Image offset and size of a file by its path inside the image ("/a/b.bin", case sensitive), for tests and logs. False when absent.

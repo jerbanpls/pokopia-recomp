@@ -19,39 +19,21 @@ nxrt is the game-independent OS and HLE runtime for the Metroid Prime Remastered
 | `src/media` | The SDK's `movie::` library on Windows Media Foundation (S9, `movie_mf.cpp`, see docs/S9.md): the 41 imports of the game are answered on the host, so the movies play |
 | `src/services` | Service library (S3c, see docs/S3c_commands.md): one file per service group (`acc.cpp`, `am.cpp`, `audio_out.cpp`, `fs.cpp`, `fs_romfs.cpp`, `fs_volume.cpp`, `hid.cpp`, `logfault.cpp`, `misc.cpp`, `network.cpp`, `pl.cpp`, `power.cpp`, `settings.cpp`, `time.cpp`, `timezone.cpp`, `vi_nv.cpp`), audio sinks (`audio_sink.cpp`, `audio_xaudio2.cpp`, `audio_paced.cpp`, `audio_wav.cpp`), shared helpers (`common.cpp`, `services_internal.h`) |
 | `apps` | `gfx_demo.cpp`: the test scene as an executable (`nxrt_gfx_demo`) |
-| `cmake` | `gfx.cmake`, `gfx_deps.cmake`: the graphics library, the demo, the gfx tests and the pinned third-party sources |
-| `tests` | 21 unit-test groups (`test_*.cpp`), `test_framework.h`, `test_main.cpp`; `tests/gfx` holds the graphics groups (`nxrt_gfx_tests`: the shell, 30 NVN groups, 8 of them scene oracles that play a small game through `nvnBootstrapLoader`; see docs/S4d.md), `tests/data/gfx` the reference image |
-| `tests/lift` | Integration tests: test programs lifted by the recompiler and run on this runtime (`driver.cpp`, `CMakeLists.txt`), the S3b exception programs (`progs`), their miniature libc++abi (`guest/rt2.h`) and its host stand-in (`native`) |
-| `tests/data` | Loader fixtures, HIPC test vectors (generated, see Build and test) |
-| `tests/fixture` | `fixture.c` and `make_fixture.cmd`, which builds the loader fixtures |
-| `tests/tools` | `gen_hipc_vectors.py` (HIPC vectors); for the lifted tests: `guest_build.py`, `make_sites.py`, `unicorn_expect.py`, `native_check.cmd`, `dump_results.py` |
+| `cmake` | `gfx.cmake`, `gfx_deps.cmake`: the graphics library, the demo and the pinned third-party sources |
+| `tests/sites` | `mpr_testtools.sites`: the site list the test tooling (`src/testtools`) needs in the lifted game |
 | `docs` | `S3.md`, `S3b.md`, `S4b.md`, `S4d.md` and `S4e.md` (dev logs, decisions and gaps; S3b has the C++ exception boundary), `nvn_struct_sizes.md` (NVN object sizes), `CONFIG.md` (every ini key and environment variable), `debug/NNN.md` (numbered bug notes) |
-| `scripts` | `build.ps1` (configure, build, optional test), `env.cmd` (MSVC, LLVM, CMake and Ninja on PATH), `gen_nvn_table.py` (NVN table), `gen_scene_shaders.py` (test-scene SPIR-V), `nvn_unit.ps1` (build and run one NVN unit test without CMake), `gen_present_shaders.py`, `gen_mask_clear_shaders.py` (SPIR-V of the present pass and the masked clear), `gen_nvn_test_api.py` (typed NVN callers for the tests), `gen_nvn_coverage_doc.py` (entry-point coverage table) |
+| `scripts` | `build.ps1` (configure and build), `env.cmd` (MSVC, LLVM, CMake and Ninja on PATH), `gen_nvn_table.py` (NVN table), `gen_scene_shaders.py` (test-scene SPIR-V), `gen_present_shaders.py`, `gen_mask_clear_shaders.py` (SPIR-V of the present pass and the masked clear) |
 
-## Build and test
+## Build
 
 Requirements: Windows x64, the Visual Studio Build Tools (`env.cmd` calls `vcvars64.bat` from the BuildTools path), LLVM installed in `C:\Program Files\LLVM` (clang-cl; CMake picks `lld-link` from it as the linker), CMake and Ninja. `build.ps1` also passes sccache as the compiler launcher.
 
     pwsh scripts\build.ps1                      configure and build into build\release
-    pwsh scripts\build.ps1 -Test                build, then run CTest
-    pwsh scripts\build.ps1 -Test -Filter <re>   run only the CTest entries matching <re>
     pwsh scripts\build.ps1 -Clean               delete build\release first
 
 Output goes to `build\<config in lower case>`, so Release builds to `build\release`.
 
 The ABI header `nxrecomp/ctx.h` comes from the recompiler (S1). CMake looks for it in `..\recomp\include` relative to the checkout (`NXRT_RECOMP_INCLUDE`, see `CMakeLists.txt`). `include/nxrt/abi.h` asserts `NXRECOMP_ABI_VERSION == 3`. A git worktree does not contain `..\recomp`, so it has to be configured once by hand with `-DNXRT_RECOMP_INCLUDE=<path of the recomp checkout>/include`. The CMake cache keeps the value for later `build.ps1` runs.
-
-Test groups: `crash`, `eh`, `eh_abi3`, `eh_typeinfo`, `hipc`, `hooks`, `ipc`, `kernel_sync`, `kernel_threads`, `loader`, `log_config`, `memguard`, `memory`, `nxmodule`, `runtime_e2e`, `smoke`, `svc_info`, `svc_memory`, `svc_names`, `symbols`, `sync`, `watchdog`. Beside them, 25 CTest entries `lift_*` run lifted programs (see Lifted-code tests). CMake reads the `NXTEST_GROUP` line of each test source and creates one CTest entry per group, with a 120 s timeout. To run one group directly, use `build\release\nxrt_tests.exe <group>`. `nxrt_tests.exe --list` prints the groups, `--all` runs everything and `--child <name>` runs a child-process mode (for example `crash_av`, `crash_trap`, `crash_stackoverflow`). The graphics shell has its own 8 groups in `nxrt_gfx_tests` (see docs/S4b.md).
-
-Snapshot on 2026-10-21 (clean Release build): CTest reported 46 of 46 entries passed (a busy machine can push the older timing tests `kernel_sync` and `kernel_threads` over their limits; rerun them alone). `build\release\nxrt_tests.exe --all` printed:
-
-    SUMMARY --all: 314 passed, 0 failed, 0 skipped (of 314)
-
-### Lifted-code tests
-
-`tests/lift` builds each test program with clang for AArch64, lifts it with `..\recomp` (the recompiler, S1), links the result with this runtime and runs it through the module loader, the module registry and a runtime guest thread (`driver.cpp`); results[] must equal the expected output. Requirements besides the runtime's own: `..\recomp`, `..\tools\.venv` (Python with unicorn) and LLVM clang for `aarch64-linux-gnu`; without them CMake skips the directory (`-DNXRT_BUILD_LIFT_TESTS=OFF` skips it on purpose). Expected output: Unicorn for the 15 programs of `recomp/oracle/e2e/progs`, the host's own C++ exceptions for the S3b programs. Run one: `build\release\tests\lift\bin\liftrun_20_eh_hier.exe --elf build\release\tests\lift\20_eh_hier.elf --expected build\release\tests\lift\20_eh_hier.expected`. Check a new program on the host first: `tests\tools\native_check.cmd tests\lift\progs\NN_name.cpp`. docs/S3b.md has the details.
-
-Fixtures: `tests\data\fixture_aarch64.elf` is a synthetic AArch64 PIE built from `tests\fixture\fixture.c`; `fixture_nosections.elf` is the same image with the section headers removed. `tests\fixture\make_fixture.cmd` rebuilds both with the LLVM tools and `fixture_info.txt` records their facts. `tests\data\hipc_vectors.h` and `hipc_vectors.md` are generated: run `python -I tests/tools/gen_hipc_vectors.py` from the checkout root, do not edit them by hand. CMake passes `tests\data` to the test binary as `NXRT_TEST_DATA_DIR`.
 
 ## Architecture
 
@@ -100,8 +82,6 @@ Every source or header file that names an upstream project in its comments is li
 | `src/core/nxmodule.cpp`, `include/nxrt/nxmodule.h` | smo-recomp `runtime/core/hostrt.c` (module tables registered at start-up, imports bound by name: pattern) | GPL-3.0 |
 | `src/eh/catch_call.cpp`, `src/eh/unwind.cpp`, `include/nxrt/eh.h` | recomp `oracle/e2e/rt/eh_rt.cpp` (S1, table walk and landing protocol: reworked and extended); ssbu-recomp `nro_catch_call` (name and idea only); Itanium C++ ABI and LLVM libc++abi `cxa_exception.h`, `cxa_personality.cpp` (header layout and two-phase behaviour: read, not copied); ssbu-recomp `runtime/eh_runtime.h` (facts only: the SDK's older `__cxa_exception` layout, no handler means terminate without unwinding) | GPL-3.0-or-later; GPL-3.0; Apache-2.0 with LLVM exception |
 | `src/eh/typeinfo.cpp` | LLVM libc++abi `private_typeinfo.cpp` (can_catch, has_unambiguous_public_base, process_found_base_class: behaviour followed, code reimplemented over guest memory); ssbu-recomp `runtime/nncxxrt.c` (facts only: the non-unique-name bit 63 of SDK typeinfos) | Apache-2.0 with LLVM exception; GPL-3.0 |
-| `tests/lift/guest/rt2.h` | LLVM libc++abi `cxa_exception.cpp` (handlerCount protocol of __cxa_begin_catch / end_catch / rethrow: behaviour followed, reimplemented freestanding) | Apache-2.0 with LLVM exception |
-| `tests/tools/guest_build.py`, `tests/tools/unicorn_expect.py` | import recomp `oracle/e2e/build_prog.py` and `unicorn_side.py` at build time (S1; not copied) | GPL-3.0-or-later |
 | `src/core/dispatch.cpp` | smo-recomp `runtime/core/hostrt.c` (pattern); SuperMarioWonderRecomp `runtime/src/loader.cpp` (pattern) | GPL-3.0; MIT |
 | `src/diag/crash.cpp` | smo-recomp `runtime/core/hostrt.c` crash_filter (idea; written from scratch) | GPL-3.0 |
 | `src/diag/memguard.cpp` | SuperMarioWonderRecomp `runtime/src/memguard_win.cpp` (adapted) | MIT |
@@ -173,7 +153,7 @@ External specifications used as references:
 - Switchbrew IPC_Marshalling page (https://switchbrew.org/wiki/IPC_Marshalling): HIPC layouts, cited in `include/nxrt/hipc.h`. No code copied.
 - Switchbrew SVC page (https://switchbrew.org/wiki/SVC): SVC numbers, names and calling convention, cited in `src/kernel/svc_names.inc` and `include/nxrt/svc.h`. No code copied.
 - Atmosphere libvapours `svc_results.hpp`: numeric result values, cited in `include/nxrt/kernel.h`. Values only.
-- libnx `sf/hipc.h` and `sf/cmif.h`: layouts. The packing functions in `tests/tools/gen_hipc_vectors.py` are re-implemented from these headers, as that script's header states, so this is not "no code copied". libnx is ISC licensed; its notice is in THIRD_PARTY_NOTICES.md.
+- libnx `sf/hipc.h` and `sf/cmif.h`: layouts. No code copied. libnx is ISC licensed; its notice is in THIRD_PARTY_NOTICES.md.
 
 ## Status and gaps
 

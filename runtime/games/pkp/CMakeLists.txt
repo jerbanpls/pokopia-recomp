@@ -15,6 +15,6 @@ add_library(nxrt_game_pkp_core STATIC "${_pkp}/pkp_core.cpp" "${_pkp}/pkp_tt_pro
 target_link_libraries(nxrt_game_pkp_core PUBLIC nxrt_game_pkp_data nxrt)
 
 if(TARGET nxrt_gfx)
-    add_library(nxrt_game_pkp STATIC "${_pkp}/pkp_game.cpp" "${_pkp}/pkp_play.cpp" "${_pkp}/pkp_gfx_heap.cpp" "${_pkp}/pkp_kbm.cpp" "${_pkp}/pkp_menu.cpp" "${_pkp}/pkp_movie_test.cpp" "${_pkp}/pkp_quality.cpp" "${_pkp}/pkp_taa.cpp")
+    add_library(nxrt_game_pkp STATIC "${_pkp}/pkp_game.cpp" "${_pkp}/pkp_play.cpp" "${_pkp}/pkp_gfx_heap.cpp" "${_pkp}/pkp_kbm.cpp" "${_pkp}/pkp_linkplay.cpp" "${_pkp}/pkp_menu.cpp" "${_pkp}/pkp_movie_test.cpp" "${_pkp}/pkp_quality.cpp" "${_pkp}/pkp_taa.cpp")
     target_link_libraries(nxrt_game_pkp PUBLIC nxrt_game_pkp_core nxrt_gfx)
 endif()

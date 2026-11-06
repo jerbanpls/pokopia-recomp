@@ -167,6 +167,19 @@ struct Device::Impl {
     std::mutex once_mu;
     VkCommandPool once_pool = VK_NULL_HANDLE;
     VkFence once_fence = VK_NULL_HANDLE;
+
+    // GPU checkpoints (record_checkpoint, report_lost): what checkpoint number s was is in ck[s % kCkRing]. Each entry is a seqlock: seq
+    // is 0 while a writer fills it, then s; the report keeps a copy only when seq read s before and after. Allocated only with the extension.
+    // 16384 entries keep a few frames of dispatches and draws (`all` records thousands a frame; frames in flight and the submit batch add up).
+    struct CkEntry {
+        std::atomic<uint64_t> seq{0};
+        std::atomic<uint64_t> hash[4] = {};   // two 16-character shader hashes
+        std::atomic<uint64_t> ab{0};          // a | b << 32
+        std::atomic<uint64_t> c_kind{0};      // c | kind << 32 | indirect << 40
+    };
+    static constexpr uint64_t kCkRing = 16384;
+    std::unique_ptr<CkEntry[]> ck;
+    std::atomic<uint64_t> ck_seq{0};
 };
 
 namespace {
@@ -278,6 +291,7 @@ void register_vma_gauges(VmaAllocator a, VkPhysicalDeviceType type) {
     nxrt::gauge_register("vma.alloc_count", [a, cache] { return static_cast<int64_t>(vma_totals(a, *cache).total.statistics.allocationCount); });
     nxrt::gauge_register("vma.alloc_mb", [a, cache] { return static_cast<int64_t>(vma_totals(a, *cache).total.statistics.allocationBytes >> 20); });
     nxrt::gauge_register("vma.block_count", [a, cache] { return static_cast<int64_t>(vma_totals(a, *cache).total.statistics.blockCount); });
+    nxrt::gauge_register("vk.vma_blocks", [a, cache] { return static_cast<int64_t>(vma_totals(a, *cache).total.statistics.blockCount); });   // WP01: same count, named with vk.memory_allocs
     nxrt::gauge_register("vma.block_mb", [a, cache] { return static_cast<int64_t>(vma_totals(a, *cache).total.statistics.blockBytes >> 20); });
 }
 
@@ -288,7 +302,7 @@ void unregister_vma_gauges() {
         g_guard_vma = nullptr;
         g_guard_heap = -1;
     }
-    const char* const names[] = {"vma.device_usage_mb", "vma.device_budget_mb", "vma.alloc_count", "vma.alloc_mb", "vma.block_count", "vma.block_mb"};
+    const char* const names[] = {"vma.device_usage_mb", "vma.device_budget_mb", "vma.alloc_count", "vma.alloc_mb", "vma.block_count", "vma.block_mb", "vk.vma_blocks"};
     for (const char* n : names) nxrt::gauge_unregister(n);
 }
 
@@ -551,6 +565,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT afbl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
     VkPhysicalDevicePresentIdFeaturesKHR apid = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDeviceAntiLagFeaturesAMD aal = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD};
+    VkPhysicalDeviceFaultFeaturesEXT afault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     std::vector<const char*> dev_exts;
     void* chain = nullptr;
     auto add_ext = [&](const char* name, void* feat_struct) {
@@ -585,9 +600,19 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     const bool x_ll2 = x_pid && has_dext(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     if (x_ll2) dev_exts.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     const bool x_aal = !headless && add_ext(VK_AMD_ANTI_LAG_EXTENSION_NAME, &aal);
+    const bool pw_exposed = has_dext("VK_KHR_present_wait"), pid_exposed = has_dext(VK_KHR_PRESENT_ID_EXTENSION_NAME);   // offered by the device (log line only)
     features_.external_memory_host = has_dext(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (features_.external_memory_host) dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (has_dext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) { dev_exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); features_.push_descriptor = true; }
+    // device-lost diagnostics (report_lost): checkpoints before each dispatch (`dispatch`, the default) or each dispatch and draw (`all`);
+    // `off` leaves the extension off (NVIDIA's driver may track checkpoints once it is enabled). The fault report is on whenever offered.
+    const std::string ck_mode = lower(config_get_str("gfx", "gpu_checkpoints", "dispatch"));
+    const int ck_level = ck_mode == "off" ? 0 : ck_mode == "all" ? 2 : 1;
+    if (ck_mode != "off" && ck_mode != "all" && ck_mode != "dispatch")
+        NXLOG_W(kTag, "[gfx] gpu_checkpoints = '%s' is not dispatch, all or off: using dispatch", ck_mode.c_str());
+    const bool x_ck = ck_level > 0 && has_dext(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    if (x_ck) dev_exts.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    const bool x_fault = add_ext(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &afault);
     // availability query: one chain holding all the structs
     a11.pNext = &a12; a12.pNext = &a13; a13.pNext = chain;
     VkPhysicalDeviceFeatures2 avail = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &a11};
@@ -660,6 +685,9 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.present_id = x_pid && apid.presentId;
     features_.low_latency2 = x_ll2 && features_.present_id;
     features_.anti_lag = x_aal && aal.antiLag;
+    afault.deviceFaultVendorBinary = VK_FALSE;   // the report reads the description, addresses and vendor codes, never the binary dump
+    features_.device_fault = x_fault && afault.deviceFault;
+    features_.checkpoints = x_ck;
     NXLOG_I(kTag, "texture compression on this GPU: BC %s, ASTC-LDR %s, ETC2 %s", features_.bc ? "yes" : "no",
             features_.astc_ldr ? "yes" : "no", features_.etc2 ? "yes" : "no");
     NXLOG_I(kTag, "features: geometry %d float64 %d int64 %d dualSrc %d logicOp %d multiViewport %d drawParams %d descIndexing %d interlock %d depthClipControl %d customBorder %d hostMemImport %d pushDesc %d feedbackLoop %d",
@@ -701,6 +729,21 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     std::vector<VkQueueFamilyProperties> qf(nq);
     vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nq, qf.data());
     timestamp_valid_bits_ = qf[queue_family_].timestampValidBits;
+    VkPipelineStageFlags2 ck_stages = 0;
+    if (x_ck) {
+        VkQueueFamilyCheckpointProperties2NV cp = {VK_STRUCTURE_TYPE_QUEUE_FAMILY_CHECKPOINT_PROPERTIES_2_NV};
+        std::vector<VkQueueFamilyProperties2> qf2(nq, VkQueueFamilyProperties2{VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2});
+        qf2[queue_family_].pNext = &cp;
+        vkGetPhysicalDeviceQueueFamilyProperties2(physical_, &nq, qf2.data());
+        ck_stages = cp.checkpointExecutionStageMask;
+        impl_->ck = std::make_unique<Impl::CkEntry[]>(Impl::kCkRing);
+        checkpoint_level_ = vkCmdSetCheckpointNV && vkGetQueueCheckpointData2NV ? ck_level : 0;
+    }
+    if (!ck_level) NXLOG_I(kTag, "device-lost diagnostics: GPU checkpoints off ([gfx] gpu_checkpoints), driver fault report %s",
+                           features_.device_fault ? "on" : "not offered");
+    else NXLOG_I(kTag, "device-lost diagnostics: GPU checkpoints %s (stages %#llx), driver fault report %s",
+                 checkpoint_level_ == 2 ? "before every dispatch and draw" : checkpoint_level_ ? "before every dispatch" : "not offered (NVIDIA only)",
+                 static_cast<unsigned long long>(ck_stages), features_.device_fault ? "on" : "not offered");
 
     VmaVulkanFunctions vf = {};
     vf.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
@@ -714,6 +757,22 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     r = vmaCreateAllocator(&aci, &vma_);
     if (r != VK_SUCCESS) return fail("vmaCreateAllocator failed (" + std::to_string(r) + ")");
     register_vma_gauges(vma_, props_.deviceType);
+    if (config_get_bool("diag", "stutter_logs", true)) {   // [diag] stutter_logs: what the driver offers for import sizing and present pacing
+        const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+        vmaGetMemoryProperties(vma_, &mp);
+        std::string heaps, types;
+        char b[96];
+        for (uint32_t i = 0; mp && i < mp->memoryHeapCount; ++i) {
+            std::snprintf(b, sizeof b, "%s%u:%llu MiB/0x%x", i ? " " : "", i, static_cast<unsigned long long>(mp->memoryHeaps[i].size >> 20), static_cast<unsigned>(mp->memoryHeaps[i].flags));
+            heaps += b;
+        }
+        for (uint32_t i = 0; mp && i < mp->memoryTypeCount; ++i) {
+            std::snprintf(b, sizeof b, "%s%u:heap%u/0x%x", i ? " " : "", i, mp->memoryTypes[i].heapIndex, static_cast<unsigned>(mp->memoryTypes[i].propertyFlags));
+            types += b;
+        }
+        NXLOG_I(kTag, "vk: memory heaps %s; types %s; maxBufferSize %llu; VK_KHR_present_wait %s; VK_KHR_present_id %s", heaps.c_str(), types.c_str(),
+                static_cast<unsigned long long>(limits_.max_buffer_size), pw_exposed ? "yes" : "no", pid_exposed ? "yes" : "no");
+    }
 
     VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -745,8 +804,121 @@ Device::~Device() {
 void Device::note_result(VkResult result, const char* operation) {
     if (result != VK_ERROR_DEVICE_LOST) return;
     bool expected = false;
-    if (device_lost_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-        NXLOG_E(kTag, "graphics device lost in %s (VK_ERROR_DEVICE_LOST); stopping further GPU work", operation ? operation : "Vulkan");
+    if (device_lost_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) report_lost(operation);
+}
+
+// ---- device-lost diagnostics ------------------------------------------------------------------------------------------
+// Ported from pokopia-native (MIT) windows/src/nxrt/vk/vk_dev.c @555813a (vk_checkpoint / vk_lost), on this device's ring and config.
+void Device::record_checkpoint(VkCommandBuffer cb, Checkpoint kind, const std::string* shader, const std::string* shader2, uint32_t a, uint32_t b,
+                               uint32_t c, bool indirect) {
+    Impl& m = *impl_;
+    const uint64_t s = m.ck_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t h[4] = {};
+    if (shader) std::memcpy(h, shader->data(), std::min<size_t>(shader->size(), 16));
+    if (shader2) std::memcpy(h + 2, shader2->data(), std::min<size_t>(shader2->size(), 16));
+    Impl::CkEntry& e = m.ck[s % Impl::kCkRing];
+    e.seq.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    for (int i = 0; i < 4; ++i) e.hash[i].store(h[i], std::memory_order_relaxed);
+    e.ab.store(a | static_cast<uint64_t>(b) << 32, std::memory_order_relaxed);
+    e.c_kind.store(c | static_cast<uint64_t>(kind) << 32 | static_cast<uint64_t>(indirect) << 40, std::memory_order_relaxed);
+    e.seq.store(s, std::memory_order_release);
+    vkCmdSetCheckpointNV(cb, reinterpret_cast<const void*>(static_cast<uintptr_t>(s)));
+}
+
+namespace {
+// What checkpoint s was, from the ring (or that it has been overwritten since).
+std::string checkpoint_text(Device::Impl& m, uint64_t s) {
+    char t[256];
+    const Device::Impl::CkEntry* e = s && m.ck ? &m.ck[s % Device::Impl::kCkRing] : nullptr;
+    uint64_t h[4] = {}, ab = 0, ck = 0;
+    bool ok = false;
+    if (e && e->seq.load(std::memory_order_acquire) == s) {
+        for (int i = 0; i < 4; ++i) h[i] = e->hash[i].load(std::memory_order_relaxed);
+        ab = e->ab.load(std::memory_order_relaxed);
+        ck = e->c_kind.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        ok = e->seq.load(std::memory_order_relaxed) == s;
+    }
+    if (!ok) {
+        std::snprintf(t, sizeof t, "#%llu (no longer kept)", static_cast<unsigned long long>(s));
+        return t;
+    }
+    char h0[17] = {}, h1[17] = {};
+    std::memcpy(h0, h, 16);
+    std::memcpy(h1, h + 2, 16);
+    const uint32_t a = static_cast<uint32_t>(ab), b = static_cast<uint32_t>(ab >> 32), c = static_cast<uint32_t>(ck);
+    const auto kind = static_cast<Device::Checkpoint>((ck >> 32) & 0xff);
+    const bool indirect = (ck >> 40) & 1;
+    const unsigned long long n = s, addr = ab;
+    if (kind == Device::Checkpoint::Dispatch) {
+        if (indirect) std::snprintf(t, sizeof t, "#%llu dispatch cs %s, indirect (arguments at guest %#llx)", n, h0[0] ? h0 : "-", addr);
+        else std::snprintf(t, sizeof t, "#%llu dispatch cs %s, %ux%ux%u groups", n, h0[0] ? h0 : "-", a, b, c);
+    } else {
+        if (indirect) std::snprintf(t, sizeof t, "#%llu draw vs %s fs %s, indirect (arguments at guest %#llx, up to %u draws)", n, h0[0] ? h0 : "-",
+                                    h1[0] ? h1 : "-", addr, c);
+        else std::snprintf(t, sizeof t, "#%llu draw vs %s fs %s, %u vertices x %u instances", n, h0[0] ? h0 : "-", h1[0] ? h1 : "-", a, b);
+    }
+    return t;
+}
+}  // namespace
+
+void Device::report_lost(const char* operation) {
+    NXLOG_E(kTag, "graphics device lost in %s (VK_ERROR_DEVICE_LOST); stopping further GPU work", operation ? operation : "Vulkan");
+    // Checkpoints: per pipeline stage, the last marker the GPU reached there. A marker sits before its dispatch or draw, so top of pipe at s
+    // means the work of s may have started and bottom of pipe at s means everything before s finished: the fault is in between.
+    if (checkpoint_level_) {
+        uint32_t n = 0;
+        vkGetQueueCheckpointData2NV(queue_, &n, nullptr);
+        std::vector<VkCheckpointData2NV> cd(n, VkCheckpointData2NV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_2_NV});
+        if (n) vkGetQueueCheckpointData2NV(queue_, &n, cd.data());
+        uint64_t done = 0, reached = 0;
+        for (uint32_t i = 0; i < n && i < cd.size(); ++i) {
+            const uint64_t s = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cd[i].pCheckpointMarker));
+            const char* at = cd[i].stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT ? "the GPU had reached" :
+                             cd[i].stage == VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT ? "everything had finished before" : "this stage had reached";
+            NXLOG_E(kTag, "  checkpoint (stage %#llx): %s %s", static_cast<unsigned long long>(cd[i].stage), at, checkpoint_text(*impl_, s).c_str());
+            if (cd[i].stage == VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT) done = std::max(done, s);
+            else reached = std::max(reached, s);
+        }
+        if (!n) NXLOG_E(kTag, "  no checkpoint was reached (the lost work came before the first marker, or is not the replay's)");
+        for (uint64_t s = done; done && s <= reached && s < done + 8; ++s) NXLOG_E(kTag, "  in flight: %s", checkpoint_text(*impl_, s).c_str());
+        if (done && reached >= done + 8) NXLOG_E(kTag, "  in flight: ... up to #%llu", static_cast<unsigned long long>(reached));
+    } else {
+        NXLOG_E(kTag, "  no GPU checkpoints (%s)", features_.checkpoints ? "[gfx] gpu_checkpoints = off" : "they need NVIDIA's VK_NV_device_diagnostic_checkpoints");
+    }
+    // The driver's fault report: a counts query, then the address and vendor records and the description (never the vendor binary).
+    if (!features_.device_fault || !vkGetDeviceFaultInfoEXT) {
+        NXLOG_E(kTag, "  no driver fault report (VK_EXT_device_fault not offered)");
+        return;
+    }
+    VkDeviceFaultCountsEXT fc = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult r = vkGetDeviceFaultInfoEXT(device_, &fc, nullptr);
+    if (r != VK_SUCCESS) {
+        NXLOG_E(kTag, "  the driver's fault report could not be read (%d)", static_cast<int>(r));
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> ai(fc.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vi(fc.vendorInfoCount);
+    fc.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT fi = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    fi.pAddressInfos = ai.empty() ? nullptr : ai.data();
+    fi.pVendorInfos = vi.empty() ? nullptr : vi.data();
+    r = vkGetDeviceFaultInfoEXT(device_, &fc, &fi);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        NXLOG_E(kTag, "  the driver's fault report could not be read (%d)", static_cast<int>(r));
+        return;
+    }
+    static const char* const kAddrType[] = {"none", "invalid read", "invalid write", "invalid execute", "unknown instruction pointer",
+                                            "invalid instruction pointer", "instruction pointer of the fault"};
+    NXLOG_E(kTag, "  driver fault report: %s (%u addresses, %u vendor records)", fi.description[0] ? fi.description : "(no description)",
+            fc.addressInfoCount, fc.vendorInfoCount);
+    for (uint32_t i = 0; i < fc.addressInfoCount && i < ai.size(); ++i)
+        NXLOG_E(kTag, "  fault address: %s at %#llx (precision %#llx)", ai[i].addressType < 7 ? kAddrType[ai[i].addressType] : "?",
+                static_cast<unsigned long long>(ai[i].reportedAddress), static_cast<unsigned long long>(ai[i].addressPrecision));
+    for (uint32_t i = 0; i < fc.vendorInfoCount && i < vi.size(); ++i)
+        NXLOG_E(kTag, "  vendor fault: %s (code %#llx, data %#llx)", vi[i].description, static_cast<unsigned long long>(vi[i].vendorFaultCode),
+                static_cast<unsigned long long>(vi[i].vendorFaultData));
 }
 
 // ---- validation -------------------------------------------------------------------------------------------------------
@@ -910,12 +1082,28 @@ VkResult Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, Memo
     ai.usage = VMA_MEMORY_USAGE_AUTO;
     if (use == MemoryUse::Upload) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     if (use == MemoryUse::Readback) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (use == MemoryUse::Shadow) {     // [nvn] pool_copy: host memory the GPU reads in place (no userptr), cached when the device has it
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        ai.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        ai.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
     VmaAllocationInfo info = {};
     Buffer b;
     VkResult r = vmaCreateBuffer(vma_, &bi, &ai, &b.buffer, &b.allocation, &info);
     if (r != VK_SUCCESS) return r;
     vk_gauge_buffers().add(1);
-    if (use == MemoryUse::Upload || use == MemoryUse::Readback) {      // S34: where host-visible buffers live (device-local host-visible = resizable BAR, else system memory)
+    if (use == MemoryUse::Shadow) {     // the memory the shadows got, once (which heap and whether cached decides their CPU and GPU cost)
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            VkMemoryPropertyFlags mp = 0;
+            vmaGetAllocationMemoryProperties(vma_, b.allocation, &mp);
+            NXLOG_I("vk", "shadow buffers (pool_copy): memory type %u, flags 0x%x (%s%s%s)", static_cast<unsigned>(info.memoryType), static_cast<unsigned>(mp),
+                    (mp & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local " : "", (mp & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "host-cached" : "write-combined",
+                    (mp & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? ", coherent" : "");
+        }
+    }
+    if (use == MemoryUse::Upload || use == MemoryUse::Readback || use == MemoryUse::Shadow) {      // S34: where host-visible buffers live (device-local host-visible = resizable BAR, else system memory)
         static std::atomic<int> logged{0};
         VkMemoryPropertyFlags mp = 0;
         vmaGetAllocationMemoryProperties(vma_, b.allocation, &mp);

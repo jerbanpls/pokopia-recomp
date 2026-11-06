@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // HIPC message encoding/decoding (the wire format of the Horizon IPC command buffer, thread-local region +0).
 // Layouts: https://switchbrew.org/wiki/IPC_Marshalling (HeaderData, SpecialHeader, MapData = A/B/W buffers, PointerData = X,
-// ReceiveListData, raw data alignment) cross-checked against libnx sf/hipc.h. Test vectors: tests/data/hipc_vectors.h.
+// ReceiveListData, raw data alignment) cross-checked against libnx sf/hipc.h.
 //
 // Message word order: [Header0 Header1] [Special header, pid (2 words), copy handles, move handles] [X descriptors, 2 words each]
 // [A descriptors, 3 words each] [B] [W] [raw data] [receive list descriptors, 2 words each]

@@ -72,6 +72,16 @@ private:
 // Busters formula, at least 3 under), never below 1. 60 -> 57, 120 -> 116, 144 -> 138.24, 240 -> 224.
 double suggest_vrr_cap(double refresh_hz);
 
+// Frame cap snapped to a divisor of the refresh rate (F5): with vsync on, a cap that is not a divisor shows frames for uneven numbers of
+// refreshes (40 on 90 Hz: 2, 2, 3, 2, 2, 3 ... refreshes). k = ceil(hz / (cap * 1.005)) (0.5 % tolerance for reported rates such as 79.98),
+// cap' = hz / k, never above the requested cap beyond the tolerance. 90 Hz: 40 -> 30, 45 -> 45, 30 -> 30; 80 Hz: 40 -> 40; 60 Hz: 40 -> 30,
+// 45 -> 30; 40 Hz: 40 -> 40 (k = 1: no snap). Only for 0 < cap < hz with hz > 0; otherwise (or when k would be 1) k = 0 and cap is returned.
+struct FrameSnap {
+    double cap = 0;     // the cap to run at (hz / k when snapped, else the requested cap)
+    int k = 0;          // refresh intervals per frame when snapped (>= 2), else 0
+};
+FrameSnap snap_frame_cap(double cap, double hz);
+
 // While the game loads (a black boot screen, a loading screen: a presented frame with almost no draws) no limiter waits: the loading code
 // advances once per frame, so pacing it at 60 Hz stretches boot and loads. The NVN replay sets it ([display] unpaced_loading, default on).
 void frame_limiter_set_unpaced(bool on);

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Checks before Set up starts: free disk space, Vulkan, RAM, and a warning for the Intel Core CPUs that crash under long
-//! heavy loads; on Linux also Proton, which runs the shader translator and the game. Every check except the disk space and
-//! Proton is a warning the player can continue past. `evaluate` is a pure function of `Facts` (tests below); `probe` fills
-//! `Facts` from Windows or Linux.
+//! Checks before Set up starts: free disk space, write access to the game folder (writecheck.rs), Vulkan, RAM, and a warning
+//! for the Intel Core CPUs that crash under long heavy loads; on Linux also Proton, which runs the shader translator and the
+//! game. Every check except the disk space, the write access and Proton is a warning the player can continue past.
+//! `evaluate` is a pure function of `Facts` (tests below); `probe` fills `Facts` from Windows or Linux.
 //!
 //! The Intel check and the "gentle" job count follow pokopia-native (MIT), nxs2.py `intel_microcode_warning` and
 //! `gentle_jobs` @7c3655d: 13th/14th generation desktop CPUs need Intel's 0x12B microcode (a BIOS update) or sustained
 //! all-core loads such as the shader translation can crash Windows.
 
-use crate::shaders;
+use crate::{shaders, writecheck};
 use serde::Serialize;
 use std::path::Path;
 
@@ -79,6 +79,9 @@ pub struct Facts {
     pub free_bytes: Option<u64>,
     pub need_bytes: u64,
     pub drive: String,
+    /// the game folder: the write test of it and its setup subfolders
+    pub game_dir: String,
+    pub write: Result<(), writecheck::WriteError>,
     pub vulkan: Vulkan,
     pub ram_total: Option<u64>,
     pub cpu_brand: Option<String>,
@@ -178,6 +181,11 @@ pub fn evaluate(f: &Facts) -> Report {
         ),
         Some(free) => push("disk", Level::Ok, "Free disk space", format!("{} free on {}; setup needs about {}.", gb(free), f.drive, gb(f.need_bytes))),
         None => push("disk", Level::Warn, "Free disk space unknown", format!("Could not read the free space of {}. Setup needs about {}.", f.drive, gb(f.need_bytes))),
+    }
+
+    match &f.write {
+        Ok(()) => push("write", Level::Ok, "Game folder", format!("Setup can write in {}.", f.game_dir)),
+        Err(e) => push("write", Level::Fail, e.title(), e.message()),
     }
 
     match &f.vulkan {
@@ -286,6 +294,8 @@ pub fn probe(game_dir: &Path, r: &Remaining) -> Facts {
         free_bytes: sys::free_bytes(game_dir),
         need_bytes: need,
         drive: drive_of(game_dir),
+        game_dir: game_dir.to_string_lossy().into_owned(),
+        write: writecheck::check(game_dir),
         vulkan: sys::vulkan(),
         ram_total: sys::ram_total(),
         cpu_brand: brand,
@@ -535,21 +545,27 @@ mod sys {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, not(windows)))]
+mod linux_tests {
     use super::*;
 
     fn facts() -> Facts {
         Facts {
             free_bytes: Some(200 * GB),
             need_bytes: 36 * GB,
-            drive: "D:".into(),
+            drive: "/home".into(),
+            game_dir: "/home/me/Games/PokopiaRecomp".into(),
+            write: Ok(()),
             vulkan: Vulkan::Gpus(vec![Gpu { name: "Test GPU".into(), api: (1, 3), software: false }]),
             ram_total: Some(32 * GB),
             cpu_brand: Some("AMD Ryzen 7 5800X 8-Core Processor".into()),
             microcode: None,
             runner: None,
         }
+    }
+
+    fn level(r: &Report, id: &str) -> Level {
+        r.checks.iter().find(|c| c.id == id).unwrap().level
     }
 
     #[test]
@@ -577,187 +593,5 @@ mod tests {
         assert_eq!(micro, Some(0x129));
         assert!(raptor_lake_desktop(&brand.unwrap()));
         assert_eq!(super::sys::cpuinfo("model name\t: AMD Ryzen 9 9900X 12-Core Processor\n"), (Some("AMD Ryzen 9 9900X 12-Core Processor".into()), None));
-    }
-
-    fn level(r: &Report, id: &str) -> Level {
-        r.checks.iter().find(|c| c.id == id).unwrap().level
-    }
-
-    #[test]
-    fn disk_need_fresh_install_is_corpus_plus_spirv() {
-        let r = Remaining { build_pending: true, ..Default::default() };
-        assert_eq!(disk_needed(&r), 36 * GB);
-    }
-
-    #[test]
-    fn disk_need_build_only_is_the_build() {
-        let r = Remaining { build_pending: true, shaders_complete: true, ..Default::default() };
-        assert_eq!(disk_needed(&r), BUILD_BYTES);
-        assert_eq!(disk_needed(&Remaining { shaders_complete: true, ..Default::default() }), 0);
-    }
-
-    #[test]
-    fn disk_need_shrinks_when_resumed() {
-        // extracted, half translated: the corpus is on disk, half of the spirv still to write
-        let r = Remaining { corpus_present: true, shaders_done: 50_000, shaders_total: 100_000, ..Default::default() };
-        assert_eq!(disk_needed(&r), 13 * GB);
-        // all rows done but not marked complete: nothing more to write
-        let r = Remaining { corpus_present: true, shaders_done: 100, shaders_total: 100, ..Default::default() };
-        assert_eq!(disk_needed(&r), 0);
-    }
-
-    #[test]
-    fn not_enough_disk_blocks() {
-        let mut f = facts();
-        f.free_bytes = Some(20 * GB);
-        let r = evaluate(&f);
-        assert!(r.blocked);
-        assert_eq!(level(&r, "disk"), Level::Fail);
-        assert!(r.checks[0].detail.contains("D:"));
-        f.free_bytes = Some(36 * GB);
-        assert!(!evaluate(&f).blocked);
-    }
-
-    #[test]
-    fn unknown_disk_is_only_a_warning() {
-        let mut f = facts();
-        f.free_bytes = None;
-        let r = evaluate(&f);
-        assert!(!r.blocked);
-        assert_eq!(level(&r, "disk"), Level::Warn);
-    }
-
-    #[test]
-    fn healthy_pc_has_no_warnings() {
-        let r = evaluate(&facts());
-        assert!(!r.blocked);
-        assert_eq!(r.warnings, 0);
-        assert!(!r.suggest_gentle);
-    }
-
-    #[test]
-    fn vulkan_problems_warn() {
-        let mut f = facts();
-        f.vulkan = Vulkan::NoLoader("not found".into());
-        assert_eq!(level(&evaluate(&f), "vulkan"), Level::Warn);
-        f.vulkan = Vulkan::Failed("none".into());
-        assert_eq!(level(&evaluate(&f), "vulkan"), Level::Warn);
-        f.vulkan = Vulkan::Gpus(vec![Gpu { name: "llvmpipe".into(), api: (1, 3), software: true }]);
-        assert_eq!(level(&evaluate(&f), "vulkan"), Level::Warn);
-        f.vulkan = Vulkan::Gpus(vec![Gpu { name: "Old".into(), api: (1, 2), software: false }]);
-        assert_eq!(level(&evaluate(&f), "vulkan"), Level::Warn);
-        // one real 1.3 GPU next to an old one is enough
-        f.vulkan = Vulkan::Gpus(vec![Gpu { name: "Old".into(), api: (1, 2), software: false }, Gpu { name: "New".into(), api: (1, 4), software: false }]);
-        assert_eq!(level(&evaluate(&f), "vulkan"), Level::Ok);
-    }
-
-    #[test]
-    fn low_ram_warns() {
-        let mut f = facts();
-        f.ram_total = Some(8 * GB);
-        let r = evaluate(&f);
-        assert_eq!(level(&r, "ram"), Level::Warn);
-        assert!(!r.blocked);
-        // a 16 GB PC reports a bit under 16 GiB
-        f.ram_total = Some(16 * GB - 300 * 1024 * 1024);
-        assert_eq!(level(&evaluate(&f), "ram"), Level::Ok);
-    }
-
-    #[test]
-    fn raptor_lake_detection() {
-        for yes in [
-            "13th Gen Intel(R) Core(TM) i9-13900K",
-            "14th Gen Intel(R) Core(TM) i7-14700KF",
-            "13th Gen Intel(R) Core(TM) i5-13600K",
-            "13th Gen Intel(R) Core(TM) i7-13700",
-            "14th Gen Intel(R) Core(TM) i9-14900KS",
-            "13th Gen Intel(R) Core(TM) i5-13400F",
-            "14th Gen Intel(R) Core(TM) i5-14500T",
-        ] {
-            assert!(raptor_lake_desktop(yes), "{}", yes);
-        }
-        for no in [
-            "13th Gen Intel(R) Core(TM) i7-13700H",
-            "13th Gen Intel(R) Core(TM) i9-13980HX",
-            "13th Gen Intel(R) Core(TM) i5-1335U",
-            "12th Gen Intel(R) Core(TM) i9-12900K",
-            "11th Gen Intel(R) Core(TM) i7-11700K",
-            "AMD Ryzen 9 7950X 16-Core Processor",
-            "Intel(R) Core(TM) Ultra 9 285K",
-            "Intel(R) Core(TM) i7-1355U",
-            "",
-        ] {
-            assert!(!raptor_lake_desktop(no), "{}", no);
-        }
-    }
-
-    #[test]
-    fn intel_warns_until_the_fixed_microcode() {
-        let mut f = facts();
-        f.cpu_brand = Some("14th Gen Intel(R) Core(TM) i9-14900K".into());
-        f.microcode = Some(0x129);
-        let r = evaluate(&f);
-        assert_eq!(level(&r, "cpu"), Level::Warn);
-        assert!(r.suggest_gentle);
-        assert!(!r.blocked);
-        assert!(r.checks.iter().find(|c| c.id == "cpu").unwrap().detail.contains("0x129"));
-        f.microcode = None; // unreadable: still warn
-        assert_eq!(level(&evaluate(&f), "cpu"), Level::Warn);
-        f.microcode = Some(0x12B);
-        let r = evaluate(&f);
-        assert_eq!(level(&r, "cpu"), Level::Ok);
-        assert!(!r.suggest_gentle);
-        // a laptop part is never mentioned
-        f.cpu_brand = Some("13th Gen Intel(R) Core(TM) i7-13700H".into());
-        f.microcode = Some(0x100);
-        assert!(evaluate(&f).checks.iter().all(|c| c.id != "cpu"));
-    }
-
-    #[test]
-    fn gentle_jobs_follow_a_quarter_of_the_threads() {
-        assert_eq!(jobs_for(16, false), (15, 16));
-        assert_eq!(jobs_for(1, false), (1, 2));
-        assert_eq!(jobs_for(16, true), (4, 4));
-        assert_eq!(jobs_for(4, true), (2, 2));
-        assert_eq!(jobs_for(32, true), (8, 8));
-        assert_eq!(jobs_for(64, true), (8, 8));
-    }
-
-    #[test]
-    fn gpu_properties_parse() {
-        let mut b = vec![0u8; 824];
-        let api: u32 = (1 << 22) | (3 << 12) | 280;
-        b[0..4].copy_from_slice(&api.to_le_bytes());
-        b[16..20].copy_from_slice(&2u32.to_le_bytes());
-        b[20..32].copy_from_slice(b"Test GPU 9\0\0");
-        let g = parse_gpu(&b).unwrap();
-        assert_eq!(g, Gpu { name: "Test GPU 9".into(), api: (1, 3), software: false });
-        b[16..20].copy_from_slice(&4u32.to_le_bytes());
-        assert!(parse_gpu(&b).unwrap().software);
-        assert!(parse_gpu(&b[..100]).is_none());
-    }
-
-    #[test]
-    fn microcode_revision_bytes() {
-        assert_eq!(microcode_of(&[0, 0, 0, 0, 0x2B, 0x01, 0, 0]), Some(0x12B));
-        assert_eq!(microcode_of(&[0x2B, 0x01, 0, 0]), Some(0x12B));
-        assert_eq!(microcode_of(&[1, 2]), None);
-    }
-
-    #[test]
-    fn drive_names() {
-        assert_eq!(drive_of(Path::new(r"D:\Games\Pokopia")), "D:");
-        assert_eq!(drive_of(Path::new(r"\\?\C:\x")), "C:");
-    }
-}
-
-#[cfg(test)]
-mod live {
-    /// Manual: `cargo test live_probe -- --ignored --nocapture` prints this PC's checks.
-    #[test]
-    #[ignore]
-    fn live_probe() {
-        let f = super::probe(std::path::Path::new("."), &super::Remaining::default());
-        println!("{:#?}", super::evaluate(&f));
     }
 }

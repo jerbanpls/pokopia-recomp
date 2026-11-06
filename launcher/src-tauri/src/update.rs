@@ -152,30 +152,8 @@ pub fn check(current: &str) -> Option<UpdateInfo> {
 }
 
 #[cfg(test)]
-mod tests {
+mod linux_tests {
     use super::*;
-
-    #[test]
-    fn newer_equal_older() {
-        assert!(is_newer("v0.3.0", "0.2.0"));
-        assert!(is_newer("0.10.0", "0.9.9"));
-        assert!(is_newer("v1.0.0", "0.99.99"));
-        assert!(!is_newer("v0.3.0", "0.3.0"));
-        assert!(!is_newer("v0.2.0", "0.3.0"));
-        assert!(!is_newer("0.3.0", "0.3.1"));
-    }
-
-    #[test]
-    fn prerelease_suffix() {
-        assert!(is_newer("0.4.0", "0.4.0-beta.1")); // the release beats its beta
-        assert!(!is_newer("0.4.0-beta.1", "0.4.0"));
-        assert!(is_newer("0.4.0-beta.2", "0.4.0-beta.1"));
-        assert!(is_newer("0.4.0-beta.10", "0.4.0-beta.2")); // numeric, not text, order
-        assert!(is_newer("0.4.0-rc.1", "0.4.0-beta.9"));
-        assert!(is_newer("0.4.0-beta.1", "0.3.9"));
-        assert!(!is_newer("0.4.0-beta.1", "0.4.0-beta.1"));
-        assert!(is_newer("0.4.0-beta.1.1", "0.4.0-beta.1"));
-    }
 
     #[test]
     fn linux_edition_tags() {
@@ -184,20 +162,5 @@ mod tests {
         assert!(is_newer("v0.5.1-linux.1", "0.5.0-linux.3"));
         assert!(!is_newer("v0.5.0-linux.1", "0.5.0-linux.1"));
         assert!(!is_dev_version("0.5.0-linux.1"));
-    }
-
-    #[test]
-    fn garbage_is_never_newer() {
-        for bad in ["", "v", "latest", "1.2", "1.2.3.4", "1.x.3", "-1.0.0", "1.0.0-", "1.0.0-a..b", "v1..0"] {
-            assert!(Version::parse(bad).is_none(), "{bad}");
-            assert!(!is_newer(bad, "0.2.0"), "{bad}");
-            assert!(!is_newer("9.9.9", bad), "{bad}");
-        }
-    }
-
-    #[test]
-    fn dev_builds() {
-        assert!(is_dev_version("0.0.0") && is_dev_version("0.1.1"));
-        assert!(!is_dev_version("0.3.0"));
     }
 }

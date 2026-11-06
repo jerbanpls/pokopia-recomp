@@ -167,7 +167,13 @@ Module* module_load_nso_memory(const void* data, size_t size, const LoadOptions&
     std::memcpy(elf.data() + sizeof eh, ph, sizeof(elf::Phdr) * n);
     NXLOG_I(kTag, "NSO %s: text 0x%x ro 0x%x data 0x%x bss 0x%x, flags 0x%x, dynamic at 0x%llx", opt.name.c_str(), seg[0].dsize, seg[1].dsize, seg[2].dsize, bss, flags,
             static_cast<unsigned long long>(dyn_vaddr));
-    return module_load_memory(elf.data(), elf.size(), opt, err);
+    Module* m = module_load_memory(elf.data(), elf.size(), opt, err);
+    if (m) {
+        uint8_t id[32];
+        std::memcpy(id, d + 0x40, sizeof id);   // ModuleId (the build id)
+        m->set_build_id(id);
+    }
+    return m;
 }
 
 Module* module_load_nso_file(const char* path, const LoadOptions& opt_in, std::string* err) {

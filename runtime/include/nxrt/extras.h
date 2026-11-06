@@ -101,6 +101,12 @@ int upscale_scene_scale();          // percent, 100 = off (a temporal mode with 
 UpscaleQuality upscale_quality();
 bool upscale_temporal();            // the mode is FSR 3, DLSS or DLAA
 int quality_percent(UpscaleQuality q);   // the preset's input scale per side in percent (Custom: -1)
+// The part of the game's scene targets that its 3D scene covers, from texel 0, 0, per side (1 = all). A game whose dynamic-resolution path
+// renders the scene into the top-left of full-size targets (Pokopia, for upscale_scene_scale) sets it; its tone-map draw samples the scene
+// at uv * fraction, so the scene upscalers upscale that part and hand the draw an image of output / fraction texels with the result in its
+// top-left output-sized corner. Set from a game thread each frame, read by the render thread.
+void scene_fraction_set(float fx, float fy);
+void scene_fraction(float* fx, float* fy);
 // The game's own projection jitter as its TAA code last stored it (NDC units, the previous frame's; pkp_taa.cpp), for the log only.
 void temporal_note_game_jitter(float x_ndc, float y_ndc);
 // The picture controls in force for the present step (lock-free; the F1 page's sliders change them live before Apply and save).

@@ -375,4 +375,149 @@ void trace_dump_targets();
 void present_on_render_thread(Window* w, int index, bool again = false);   // again: present_again (not counted as a game present)
 void present_again();
 
+// ---- never-block compiles (WP06) -------------------------------------------------------------------------------------------
+// The replay's frame detector (note_frame_for_pacing, nvn_replay.cpp): true while the game loads (light frames while it stalls, or boot's
+// light run), and before the first present. Runs whether or not [display] unpaced_loading acts on it. Render thread.
+bool replay_loading();
+// The NVNmemoryPoolFlags of the pool holding a GPU address, 0 when it is in no pool (nvn_gpu_pool.cpp). Any thread.
+uint32_t pool_flags_at(uint64_t gpu_address);
+// True once download_texture copied the texture's image into game memory (the CPU reads it): [nvn] async_compute never skips a dispatch
+// that writes it (nvn_gpu_texture.cpp). Render thread; creates nothing.
+bool tex_was_read_back(Texture* t);
+// ---- readback ([nvn] readback_async, nvn_gpu.cpp / nvn_gpu_texture.cpp) -----------------------------------------------------------
+// Any thread but the render thread. queue_record: queue_submit without the GPU wait (returns the serial once the render thread recorded
+// the job). wait_serial_grace: up to grace_ns for the render thread to flush the serial itself, then wait_serial(serial, UINT64_MAX).
+uint64_t queue_record(std::function<void(struct Frame&)> record);
+bool wait_serial_grace(uint64_t serial, uint64_t grace_ns);
+// download_texture's counts (any thread; tests, the summary): copies recorded, readbacks skipped as unchanged, readbacks in all.
+struct ReadbackStats { uint64_t copies = 0, skipped = 0, calls = 0; };
+ReadbackStats readback_stats();
+
+// ---- pool import attribution ([diag] stutter_logs; nvn_gpu_pool.cpp import_range) -----------------------------------------------------
+// Why the code on this thread is resolving pool memory: import_range counts every import under the reason current when it ran
+// (gauges nvn.pool.import.reason.<name>). Render thread; an import on another thread counts as kReasonOther.
+enum PoolReason { kReasonOther, kReasonVertex, kReasonIndex, kReasonUniform, kReasonStorage, kReasonTexel, kReasonIndirect, kReasonCopy,
+                  kReasonImageCopy, kReasonUpdate, kReasonUntile, kReasonCount };
+inline thread_local PoolReason t_pool_reason = kReasonOther;
+struct PoolReasonScope {
+    PoolReason saved;
+    explicit PoolReasonScope(PoolReason r) : saved(t_pool_reason) { t_pool_reason = r; }
+    ~PoolReasonScope() { t_pool_reason = saved; }
+    PoolReasonScope(const PoolReasonScope&) = delete;
+    PoolReasonScope& operator=(const PoolReasonScope&) = delete;
+};
+inline PoolReason pool_reason() { return t_pool_reason; }
+// [nvn] one_submit (render thread, in the present): present_take_parked takes the batch flushes whose submit-worker jobs have not started
+// yet, before the present's submit_drain; take_batch_for_present then puts them in the present's vkQueueSubmit2 ahead of the frame's own
+// batch. present_give_back hands what was taken and not used back to the worker, each flush on its own (a present that ends early, or
+// one about to wait in the frame limiter). No-ops when one_submit is off.
+void present_take_parked();
+void present_give_back();
+
 }  // namespace nxrt::nvn::be::gpu
+
+// ---- pool storage (nvn_gpu_pool.cpp, nvn_pool_copy.cpp) ------------------------------------------------------------------------
+#include <deque>
+#include <memory>
+namespace nxrt::nvn::be {
+namespace gpu { struct Mirror; }
+
+// One Vulkan buffer over a byte range of a pool: an import (its own private view, VkDeviceMemory and VkBuffer), or with [nvn] pool_copy a
+// host-visible buffer of its own (shadow) that holds a copy of the range (nvn_pool_copy.cpp).
+struct PoolChunk {
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    void* view = nullptr;             // private small view of the heap section the import goes through (nullptr: imported at its own address)
+    uint64_t off = 0;                 // pool offset (from PoolGpu::base) of byte 0 of the import
+    VkDeviceSize size = 0;
+    bool tried = false;               // import attempted
+    bool failed = false;
+    uint32_t used_at = 0;             // lazy pools: present count of the last bind that resolved to it
+    uint64_t used_serial = 0;         // lazy pools: the submission being recorded at that bind (dropped only once it has completed)
+    // [nvn] pool_copy: buffer = shadow.buffer, mem = VK_NULL_HANDLE. page_copied[k] = serial of the last guest -> shadow copy of page k of
+    // the chunk (0: never). land_refs: GPU writes recorded into it that have not landed in guest memory yet (under the landing mutex).
+    // cov_*: chunk pages [cov_lo, cov_hi) were all copied in submission cov_serial (the touch's fast path). Render thread except land_refs.
+    gfx::Buffer shadow;
+    bool is_shadow = false;
+    std::vector<uint64_t> page_copied;
+    uint32_t land_refs = 0;
+    uint64_t cov_serial = 0, cov_lo = 0, cov_hi = 0;
+    struct PoolGpu* owner = nullptr;  // shadow chunks: the pool (eviction)
+};
+
+// A pool is imported whole (one chunk; the background importer does it) or, when it is larger than one chunk ([nvn] pool_import_chunk_mb), in
+// chunks imported on the render thread the first time an address in them is resolved. Chunk k covers pool bytes [k*stride, k*stride + clen):
+// neighbouring chunks overlap by clen - stride bytes, so any range that short lies wholly in one chunk. Each chunk goes through its own private
+// view of the section (never the same host pointer twice: the spec lets a driver refuse importing the same pointer again). A longer range
+// that crosses a stride boundary gets a span: one more import over the strides it touches (rare; logged).
+struct PoolGpu {
+    uint8_t* base = nullptr;          // aligned start of the pool's imports
+    VkDeviceSize size = 0;            // aligned size
+    bool failed = false;
+    bool viewed = false;              // imports go through private views of the heap section (the mirror needs that)
+    int flags = 0;
+    uint64_t stride = 0;              // chunk k starts at k * stride (whole import: stride = size)
+    uint64_t clen = 0;                // bytes per chunk (the last one may be shorter)
+    std::vector<PoolChunk> chunks;
+    std::deque<PoolChunk> spans;      // imports of ranges longer than the overlap that cross a stride boundary (deque: stable addresses)
+    gpu::Mirror* mirror = nullptr;  // device-local copy of the pages draws read (S38, [nvn] pool_mirror); render thread
+    bool mirror_tried = false;
+    // [nvn] pool_lazy: imported in pieces as binds first touch them (stride = the cell size). The pool is cut into cells; an import (ext) is
+    // a run of whole cells, made when a bind touches cells no import holds yet, and no two of them share a page (same-address imports
+    // that overlap are refused by some drivers: VK_ERROR_INVALID_EXTERNAL_HANDLE on the RX 9060 XT). cell_ext[k] = index in ext of the
+    // import holding cell k, -1: none. A bind that runs from one import into cells another one holds gets a span (overlapping; spans).
+    // An import no bind used for [nvn] pool_lazy_idle presents is dropped (lazy_drop_idle).
+    bool lazy = false;
+    std::deque<PoolChunk> ext;
+    std::vector<int32_t> cell_ext;
+    std::vector<int32_t> ext_free;    // indices of dropped imports in ext, reused
+    // [nvn] pool_copy: the pool's cells (and spans) are shadows, never imports (lazy is set too: same cell structure). page_gpu[p] = the
+    // highest serial with a GPU write recorded into page p of the pool (any chunk or span), 0 once that write has landed. Copy-mode spans
+    // are destroyed in place, never erased (land records point at them).
+    bool copy = false;
+    std::unique_ptr<std::atomic<uint64_t>[]> page_gpu;
+};
+
+namespace gpu {
+// ---- [nvn] pool_copy = auto | on | off (nvn_pool_copy.cpp) ----------------------------------------------------------------------
+// Copy (shadow) mode: pool cells live in host-visible Vulkan buffers of their own instead of userptr imports of guest memory. Every resolve
+// copies the page-rounded range it touches from guest memory into the shadow (once per submission per page, never over a page with a GPU
+// write in flight); GPU writes are recorded at record time and copied back into guest memory when their serial completes, before any
+// caller sees it complete (read_completed). Phase 1: no write tracking.
+bool pool_copy_on();                                  // read once (auto: on under Wine); logged
+uint64_t pool_copy_cell();                            // [nvn] pool_copy_cell_mb in bytes
+uint32_t pool_copy_idle();                            // [nvn] pool_copy_idle presents
+bool pool_copy_any();                                 // any thread: a copy pool exists (cheap)
+void pcopy_pool_init(PoolGpu* g);                     // import_pool: page_gpu, the landing thread
+// A shadow over pool bytes [off, off + size) into c (what import_range does for an import). False: the caller imports it instead.
+bool pcopy_alloc(PoolGpu* g, PoolChunk& c, uint64_t off, uint64_t size, const char* what);
+// A shadow span over the cells [off, off + size) touches: an existing one or a new one (*made). Null: none could be made.
+PoolChunk* pcopy_span(PoolGpu* g, uint64_t off, uint64_t size, bool* made);
+void pcopy_free(PoolChunk& c);                        // destroy_chunk of a shadow (its land records are dropped)
+bool pcopy_busy(const PoolChunk& c);                  // GPU writes into it have not landed yet (land_refs != 0)
+void pcopy_touch(PoolGpu* g, PoolChunk* c, uint64_t off, uint64_t size);   // resolve_in_pool: guest -> shadow for the range (off: pool offset)
+// note_gpu_write: a GPU write of the submission being recorded (hint: the buffer it writes, when the caller knows it)
+void pcopy_note_write(uint64_t gpu_address, uint64_t size, VkBuffer hint = VK_NULL_HANDLE);
+// The GPU reads [gpu_address, +size) from the buffer the last resolve of gpu_address gave (a bind resolved with a smaller size, e.g. the
+// index buffer of an indirect draw): the rest of the range is copied too. No-op when copy mode is off.
+void pool_copy_touch(uint64_t gpu_address, uint64_t size);
+uint64_t pcopy_land(uint64_t reached);                // any thread: lands every recorded write of a serial <= reached (read_completed)
+void pcopy_shutdown();                                // pool_shutdown: stops the landing thread, drops records
+void pcopy_log_summary(uint32_t presents);            // every 1200 presents (lazy_drop_idle)
+void pcopy_evict_for(uint64_t bytes);                 // over [nvn] pool_copy_mb: drops least recently used idle shadows first
+// nvn_gpu_pool.cpp: removes a lazy (or copy) cell import / shadow from its pool and destroys it (lazy_drop_idle, pcopy_evict_for).
+void pool_drop_ext(PoolGpu* g, size_t ext_index);
+void pool_drop_span(PoolGpu* g, PoolChunk& c);
+bool pool_drop_chunk_if_live(PoolGpu* g, PoolChunk* c);   // pcopy_evict_for: under g_live_mu, only if g is still live and owns c
+// nvn_gpu.cpp: waits up to timeout_ns for the timeline to reach serial (the landing thread). False: timed out, device lost or no back end.
+bool timeline_wait(uint64_t serial, uint64_t timeout_ns);
+uint64_t recording_serial();                          // the serial being recorded, 0 outside a recording (render thread)
+struct PoolCopyStats {
+    bool on = false;
+    int64_t live_bytes = 0;
+    uint64_t chunks = 0, allocs = 0, copied_bytes = 0, landed_bytes = 0, records = 0, pending = 0;
+    uint64_t write_unmatched = 0, import_fallback = 0, unreadable = 0, span_writes = 0, evicted = 0;
+};
+PoolCopyStats pool_copy_stats();                      // any thread (statistics, tests)
+}  // namespace gpu
+}  // namespace nxrt::nvn::be
