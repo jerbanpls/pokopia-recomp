@@ -1,103 +1,83 @@
-# Pokopia Launcher
+# Pokopia Launcher (Linux)
 
-Tauri 2 launcher for the Pokopia PC port (`pkp.exe`). It ships no game files and never changes yours. It reads the game
-files you extracted from your own copy, writes `pkp.ini` next to `pkp.exe` and builds the shader cache from your romfs.
+Tauri 2 launcher for Pokopia Recomp, built as a native Linux program (Tauri draws it with WebKitGTK). It ships no game files and
+never changes yours: it reads the game files dumped from your own copy, compiles the game from them (`pkp.exe`), builds the
+shader cache from your romfs, writes `pkp.ini` and starts the game through Proton.
 
 ## First run
 
-1. **Game files**: pick the dump folder (`<dump>\base\{exefs,romfs}` and/or `<dump>\updates\<version>\{exefs,romfs}`).
-   The newest complete update is used, otherwise the base. "Use these game files" writes `[fs] exefs` and `[fs] romfs`.
-2. **Set up**: writes the `pkp.ini` paths (`[fs] exefs`, `[fs] romfs`, `[fs] save_dir`, `[nvn] shader_cache =
-   shader_cache/spirv`) and builds `shader_cache\spirv\` next to `pkp.exe`:
-   - Extract: `tools\shaders\extract_corpus.py` finds every shader in the romfs and in `exefs\main` and writes the
-     distinct blocks to `shader_cache\corpus\` (about 10 GB, deleted when setup finishes).
-   - Translate: `tools\spirv_harness\spirv_harness.exe --batch` in chunks of 1000 into `shader_cache\spirv\`
-     (`<hash>.spv` + `results.tsv`, about 26 GB for the 99,012 blocks of 2.0.1).
-   A progress bar shows each step. Pause stops the tools and Continue setup picks up where they stopped: a block listed
-   in `results.tsv` is never translated twice, and extraction is skipped if it already ran for the same romfs. The tools
-   run at below-normal priority.
-   State: `shader_cache\setup.json`.
-   Before it starts, Set up checks the free disk space on the game drive (it refuses to start without about 36 GB, less
-   when resumed), Vulkan 1.3 (vulkan-1.dll and a GPU), RAM, and warns about 13th/14th generation Intel desktop CPUs
-   whose microcode is older than 0x12B (a BIOS update fixes their crashes under long loads). Warnings can be continued
-   past. "Use fewer cores" runs setup with a quarter of the threads (2 to 8) at idle priority.
-   Everything setup does is appended to `setup.log` next to `pkp.exe` (UTC timestamps, the commands, the tools' error
-   output; rotated to `setup.log.prev` at 2 MB). The Set up card has an "Open setup log" button; attach the file to
-   bug reports about a failed setup.
-3. **Play** turns on once setup has finished. The launcher starts pkp.exe with no paths on the command line. A `pkp.ini`
-   next to it makes its folder the working directory, and every path comes from the ini (relative paths start there).
+1. **Game files**: pick the dump folder (`<dump>/base/{exefs,romfs}` and/or `<dump>/updates/<version>/{exefs,romfs}`) or a
+   `.nup` (unpacked into `nup_dump/`). The newest complete update is used, layered over the base game's romfs when the update
+   holds only the files it changes. "Use these game files" writes `[fs] exefs`, `[fs] romfs` and `[fs] romfs_base`.
+2. **Set up**, after the checks below (disk space, write access, Vulkan, memory, processor, Proton):
+   - **Build tools** (`src-tauri/src/host.rs`, once): Python 3.13 from python-build-standalone with the lz4 and capstone
+     wheels, and Zig 0.17.0, into `tools/linux/`, each pinned by size and SHA-256.
+   - **Game build** (`src-tauri/src/gamebuild.rs`): `tools/build/pkp_build.py` verifies the ExeFS by hash, lifts the four
+     modules, compiles them with Zig and links `pkp.exe` against `pkp_rt.dll`. The script caps parallel compiles at the free
+     memory (`/proc/meminfo`) divided by 2 GiB.
+   - **Shaders** (`src-tauri/src/shaders.rs`): `tools/shaders/extract_corpus.py` writes the distinct shader blocks of the romfs
+     and `exefs/main` to `shader_cache/corpus/` (about 10 GB, deleted at the end); `tools/spirv_harness/spirv_harness.exe`
+     translates them through Proton in chunks of 5000 into `shader_cache/spirv/` (`<hash>.spv` + `results.tsv`, about 26 GB).
+   - **Hidden first run**: the game plays 60 s without a window or sound, with a save folder of its own, to record the shaders
+     it builds while it runs; they are translated before the first real start.
 
-`release\Play.bat` starts the game the same way without the launcher (after setup).
+   Pause stops the running tool and everything it started (its process group, Proton's wine processes included); Set up
+   again continues where it stopped. Everything Set up does goes to `setup.log` in the game folder ("Open setup log").
+3. **Play**: starts `pkp.exe` through Proton with no paths on the command line; a `pkp.ini` next to it makes its folder the
+   working directory, and every path comes from the ini. Before every start the run-time shaders seen so far are translated,
+   and after the game exits the new ones.
 
 ## Release model (b): pkp.exe built on the player's PC
 
-When `tools\build\pkp_build.py` is present (the package from the main project's release script), the release holds no
-`pkp.exe`. Set up first builds it from the chosen dump (`src-tauri/src/gamebuild.rs`): verify the ExeFS by hash, lift,
-compile with the bundled Zig, link against `pkp_rt.dll`; then the shader steps below run. Play stays off until both are
-done. Pause works in every step and Continue setup resumes. A built pkp.exe counts only while `build\done.json` matches
-the tools of the release in use (`pkp_build.py --check`: lifter, `main.sites`, compile flags, SDK files, `pkp_rt.lib`), so
-an update extracted over an install that changes any of them turns Play off with "This update changes the game code"
-until Set up rebuilds pkp.exe (the shader cache is kept). Headless check of the whole first run:
-`cargo run --release --example first_run -- <game dir> <exefs> <romfs> <tools dir> [shader limit] [jobs]`.
+The release holds no `pkp.exe`. A built one counts only while `build/done.json` matches the tools of the release in use
+(`pkp_build.py --check`: lifter, `main.sites`, compile flags, SDK files, `pkp_rt.lib`), so an update that changes any of them
+turns Play off with "This update changes the game code" until Set up rebuilds `pkp.exe`; the shader cache is kept.
+Headless check of the whole first run: `cargo run --release --example first_run -- <game dir> <exefs> <romfs> <tools dir>
+[shader limit] [jobs]`.
+
+## Running the programs it starts (`src-tauri/src/host.rs`)
+
+- **Proton:** Steam's Proton Experimental, else the newest Proton N.N Steam installed, started inside the Steam Linux Runtime
+  its `toolmanifest.vdf` asks for (as Steam starts a game), with `STEAM_COMPAT_DATA_PATH` =
+  `~/.local/share/pokopia-recomp/proton`. `PKP_PROTON=<folder>` picks another Proton build. Without Steam: `umu-run`, then
+  `wine`. Paths handed to programs run through it are `Z:\...`.
+- **Environment:** every Proton run gets driver shader caches of the game's own that are never trimmed
+  (`~/.local/share/pokopia-recomp/shadercache/{nvidia,mesa}`, as Steam sets them up for its games). Inside an AppImage,
+  `host::command()` removes the variables the AppImage runtime points into its mount (`GTK_PATH`, `XDG_DATA_DIRS` entries,
+  `APPDIR`, `APPIMAGE`, ...) from the environment of every program the launcher starts.
+- **Speed:** Set up writes `[nvn] pool_mirror = off` and `tex_write_watch = false` unless they are set: under Proton their
+  write-watching makes the GPU driver map the game's memory again after each caught write (measured: 107 stalls of 60-180 ms in
+  a 24-minute session; none with both off). `pool_mirror` in `pkp.ini` outranks the F1 page's "Faster GPU memory".
+- **Desktop:** the checks read statvfs, `/proc` and `libvulkan.so.1`; Link Play lists addresses from getifaddrs and
+  `/proc/net/route`; save import looks in `~/.local/share/eden` and `~/.config/Ryujinx`; files open with `xdg-open`; on NVIDIA
+  the launcher sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` (a blank window otherwise).
+- **Shortcuts:** `PokopiaLauncher --play [--game <folder>]` does what Play does without the window and waits for the game.
+- **Where it looks:** `tools/` next to the launcher, or next to the `.AppImage` file (`$APPIMAGE`) when it runs as one. The
+  game folder is the same unless set in Settings.
 
 ## Release folder
 
-The launcher looks for its tools in `tools\` next to its own exe. A release folder must contain:
-
 ```
-pkp.exe                     the game (game-build, -Release)
-PokopiaLauncher.exe         this launcher (npm run tauri build)
-Play.bat                    release\Play.bat (optional)
-tools\
-  spirv_harness\            self-contained publish of nx tools/shaders/harness:
-                              dotnet publish tools\shaders\harness\SpirvHarness.csproj -c Release -r win-x64
-                                --self-contained true -o <release>\tools\spirv_harness     (~84 MB)
-                            (stage the Ryujinx sources first: tools\shaders\scripts\setup_ryujinx.ps1)
-  shaders\extract_corpus.py nx tools/shaders/ampere/extract_corpus.py
-  python\python.exe         optional: Python 3 (for example the embeddable package) with the lz4 package installed.
-                            Without it the first python.exe on PATH that can `import lz4.block` is used.
+PokopiaLauncher                  this launcher (native; needs WebKitGTK 4.1 and glibc 2.35+)
+PokopiaLauncher-x86_64.AppImage  the same launcher with its own libraries
+install-shortcut.sh              adds the launcher to the app menu and the desktop
+pkp_rt.dll, astcdec-*.dll        the runtime and its texture decoders (Pokopia Recomp release)
+upscalers/, assets/, fonts/      from the Pokopia Recomp release
+tools/
+  build/                         pkp_build.py (this repository's), the lifter, the SDK files, dump_hashes.json
+  shaders/extract_corpus.py
+  spirv_harness/                 the shader translator (run through Proton)
+  linux/                         Python and Zig, fetched by the first Set up
 ```
 
-If a file is missing, setup stops and names it. `pkp.exe` can live in another folder (Settings, game folder), but
-`tools\` always sits next to the launcher.
-
-## Linux (Bazzite, SteamOS, other distributions)
-
-The launcher also builds as a native Linux program (`npm run tauri build -- --no-bundle` on Linux). Tauri draws it with WebKitGTK
-there, so it needs no WebView2 (which Proton lacks: the Windows launcher does not start under Proton). Put the binary in the
-release folder next to `tools\` as `PokopiaLauncher`. The game stays the Windows pkp.exe; what differs is in `src-tauri/src/host.rs`:
-
-- The build tools run natively from `tools/linux/`. Set up first downloads Python 3.13 (python-build-standalone) with the lz4 and
-  capstone wheels, and Zig 0.17.0, each pinned by size and SHA-256. Off Windows `pkp_build.py` compiles with that Zig, reads free
-  memory from `/proc/meminfo` and starts its tools without the Windows creation flags.
-- The shader translator and pkp.exe (the hidden first run and Play) run through Proton: Steam's Proton Experimental, else the newest
-  Proton N.N, inside the Steam Linux Runtime as Steam starts a game, with its prefix in `~/.local/share/pokopia-recomp/proton`.
-  `PKP_PROTON=<folder>` picks another Proton build. Without Steam: `umu-run`, then `wine`. Paths handed to them are `Z:\...`.
-  Linux translates in chunks of 5000 (every run also starts Proton), and Pause kills the tool's whole process group.
-- The checks before Set up read statvfs, `/proc` and `libvulkan.so.1`, and Set up refuses to start without Proton. Link Play lists
-  addresses from getifaddrs (Tailscale and ZeroTier as overlays, bridges and VPNs skipped); save import looks in
-  `~/.local/share/eden` and `~/.config/Ryujinx`; files and links open with `xdg-open`. On NVIDIA the launcher sets
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1` (a blank window otherwise).
-- Speed: Set up writes `[nvn] pool_mirror = off` and `tex_write_watch = false` unless they are set. Their write-watching makes
-  the GPU driver map the game's memory again after each caught write under Proton (measured: 107 stalls of 60-180 ms, worst
-  frame 5 s, in a 24-minute session; none with both off). On Linux `pool_mirror` there outranks the F1 page's "Faster GPU
-  memory". The game also gets driver shader caches of its own that are never trimmed
-  (`~/.local/share/pokopia-recomp/shadercache`), as Steam gives the games it starts.
-- `PokopiaLauncher --play [--game <folder>]` starts the game as Play does, without the window, and waits for it: for a
-  Steam or Sunshine shortcut (Sunshine `apps.json`: `"cmd": "<game folder>/PokopiaLauncher --play"`). It works on Windows too.
-- Building needs the webkit2gtk-4.1, gtk3 and libsoup3 development packages. On Bazzite, in a Fedora toolbox:
-  `distrobox create -n pokopia-build -i registry.fedoraproject.org/fedora-toolbox:45`, then
-  `sudo dnf install rust cargo nodejs npm gcc webkit2gtk4.1-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel`.
-
-Tested on Bazzite 45 (Ryzen 9 9900X with 12 threads, 16 GB, RTX 4070 Ti, Wayland), end to end with a 2.0.1 (update 655360)
-dump: Set up built pkp.exe in 12 minutes (the 2 GiB-per-compile memory cap ran 3 of the 284 units at a time), translated the
-99,012 shaders in 17 minutes under Proton Experimental in the Steam Linux Runtime 4 (about 95 a second), and the hidden first run
-collected 212 run-time shaders; Play then ran the game. Also `cargo test`, `cargo check --target x86_64-pc-windows-gnu
---all-targets`, `test_pkp_build.py`, Link Play addresses and Eden save detection. Not tried yet: Pause and Continue in the middle of
-the shader translation, the umu-run and Wine fallbacks, AMD GPUs and the Steam Deck, and the DLSS download.
+`linux/package.sh` makes this folder from the official release zip and the launchers built in `linux/Containerfile`.
 
 ## Development
 
-- `cargo check` in `src-tauri`; `npm run tauri build` for the exe.
-- `cargo run --example shader_setup -- <game dir> <romfs> <exefs/main> <tools dir> [limit] [jobs]` runs the setup's
-  shader steps without the window (same code, `src-tauri/src/shaders.rs`); `limit` translates only that many blocks.
+- `cargo test` in `src-tauri` (the Linux tests are the `linux_tests` modules and `host.rs`'s tests).
+- `npm ci && npm run tauri build -- --no-bundle` builds `src-tauri/target/release/pokopia-launcher` with the system's toolchain
+  (Rust, Node.js, and the webkit2gtk-4.1, gtk3 and libsoup3 development packages; on Bazzite in a Fedora toolbox:
+  `distrobox create -n pokopia-build -i registry.fedoraproject.org/fedora-toolbox:45`, then `sudo dnf install rust cargo nodejs
+  npm gcc webkit2gtk4.1-devel gtk3-devel libsoup3-devel javascriptcoregtk4.1-devel`).
+- `cargo run --example shader_setup -- <game dir> <romfs> <exefs/main> <tools dir> [limit] [jobs]` runs the shader steps without
+  the window; `limit` translates only that many blocks.

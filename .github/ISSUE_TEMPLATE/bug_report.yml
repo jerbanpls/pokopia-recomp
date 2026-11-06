@@ -12,18 +12,18 @@ body:
   - type: input
     id: commit
     attributes:
-      label: Commit you built
-      placeholder: e.g. a1b2c3d
+      label: Release or commit
+      placeholder: e.g. v0.6.0-linux.1
     validations:
       required: true
   - type: input
     id: system
     attributes:
-      label: GPU, driver and Windows version
+      label: GPU and driver, Linux distribution, Proton version
     validations:
       required: true
   - type: textarea
     id: log
     attributes:
       label: pkp.log
-      description: Drag in pkp.log from the session where it happened.
+      description: Drag in pkp.log (or setup.log for a Set up problem) from the session where it happened.

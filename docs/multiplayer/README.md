@@ -1,7 +1,7 @@
 # Multiplayer (Link Play) — experimental
 
 Pokopia's **Link Play** (local wireless, two players on one island) running between two PCs through the relay server.
-First working session on 2026-11-03: a Windows PC hosting and a Legion Go S (Proton) visiting.
+First working session on 2026-11-03: a desktop PC hosting and a Legion Go S (Proton) visiting.
 
 ![Two players on one island](linkplay-1.webp)
 ![The same session from the other view](linkplay-2.webp)
@@ -23,8 +23,8 @@ mobile, long distance) UDP avoids one lost packet holding up every packet behind
 The launcher has a **Link Play** page that does steps 1 and 2 below for you: pick Alone, Host on this PC (starts the relay, shows the
 address and a room code) or Visit (type the host address and code). It writes `[net] server` and `room_code` in pkp.ini.
 
-1. Start a relay server on one PC: `PokopiaLauncher.exe --host` (port 39660; `--port N` to change it; `--no-udp`: TCP only).
-   Other PCs on the LAN need that port reachable (Windows Firewall: allow it on private networks). A relay behind a router
+1. Start a relay server on one PC: `./PokopiaLauncher --host` (port 39660; `--port N` to change it; `--no-udp`: TCP only).
+   Other PCs on the LAN need that port reachable (firewalld: `sudo firewall-cmd --add-port=39660/tcp --add-port=39660/udp`). A relay behind a router
    needs TCP **and** UDP 39660 forwarded (TCP alone works, without the UDP benefit).
 2. On every player's PC, `pkp.ini`:
 

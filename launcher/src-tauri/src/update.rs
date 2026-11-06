@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::io::Read;
 use std::time::Duration;
 
-/// The Linux edition's releases, tagged `v<upstream version>-linux.<n>` (v0.5.0-linux.1).
+/// The Linux edition's releases, tagged `v<upstream version>-linux.<n>` (v0.6.0-linux.1).
 const REPO: &str = "jerbanpls/pokopia-recomp";
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Builds from a checkout carry these (0.0.0 = untagged build, 0.1.1 = the Cargo.toml default); a tagged release stamps its own.
