@@ -59,8 +59,7 @@ Based on Pokopia Recomp **0.6.0 (build J: Jaguar)**. The first release of the Li
   yet.
 - **FSR 3 and DLSS/DLAA** do not look right yet (the image shakes and lights flash, also upstream): use FSR 1.
 - **Not tested yet:** AMD and Intel GPUs, the Steam Deck and SteamOS, the AppImage on other distributions, umu-run and Wine
-  instead of Steam's Proton, the Steam and Sunshine shortcuts, and pausing in the middle of the shader translation. Reports
-  welcome.
+  instead of Steam's Proton, and the Steam and Sunshine shortcuts. Reports welcome.
 
 ### For developers
 - `src-tauri/src/host.rs` holds everything that differs on Linux: the build tools, the Proton runner, `Z:\` paths for the

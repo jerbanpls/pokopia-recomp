@@ -76,6 +76,8 @@ struct Overview {
     game_dir: String,
     default_game_dir: String,
     exe_exists: bool,
+    /// this release builds pkp.exe itself (Set up), so a missing one only means setup has not run yet
+    builds_exe: bool,
 }
 
 #[tauri::command]
@@ -121,6 +123,7 @@ fn get_overview(app: AppHandle) -> Overview {
         game_dir: dump::fwd(&dir),
         default_game_dir: dump::fwd(&exe_dir()),
         exe_exists: dir.join("pkp.exe").is_file(),
+        builds_exe: gamebuild::is_package_b(&exe_dir().join("tools")),
     }
 }
 

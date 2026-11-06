@@ -37,11 +37,13 @@ export async function render(el, ctx) {
     const problems = [];
     if (!cfg.dump_dir) problems.push('No game files chosen yet.');
     else if (!chosen) problems.push(`The game files at ${cfg.dump_dir} are not usable: ${report.errors.join(' ')}`);
-    if (!ov.exe_exists) problems.push(`pkp.exe was not found in ${ov.game_dir}. Put the launcher next to pkp.exe, or set the game folder in Settings.`);
-    if (chosen && ov.exe_exists && !setup.complete) {
+    // a release that builds pkp.exe itself has none until Set up ran: that is not a misplaced launcher
+    if (!ov.exe_exists && !ov.builds_exe) problems.push(`pkp.exe was not found in ${ov.game_dir}. Put the launcher next to pkp.exe, or set the game folder in Settings.`);
+    if (chosen && (ov.exe_exists || ov.builds_exe) && !setup.complete) {
       problems.push(setup.progress.state === 'running' ? 'Setup is still running (Game files).'
         : setup.rebuild ? 'This update changes the game code: open Game files and press Set up again to rebuild pkp.exe (about 7 minutes). Your shaders and saves are kept.'
-        : 'Setup is not finished yet: open Game files and press Set up.');
+        : ov.exe_exists ? 'Setup is not finished yet: open Game files and press Set up.'
+        : 'Set up has not run yet: open Game files and press Set up. It builds the game (pkp.exe) from your game files.');
     }
     const ready = problems.length === 0;
 
@@ -70,7 +72,7 @@ export async function render(el, ctx) {
             <dt>Shaders</dt>
             <dd>${setup.complete ? 'ready' : '<span class="faint">not set up</span>'}</dd>
             <dt>Game folder</dt>
-            <dd>${ov.exe_exists ? 'pkp.exe found' : '<span class="faint">pkp.exe missing</span>'}<div class="path">${esc(ov.game_dir)}</div></dd>
+            <dd>${ov.exe_exists ? 'pkp.exe found' : `<span class="faint">${ov.builds_exe ? 'pkp.exe not built yet (Set up builds it)' : 'pkp.exe missing'}</span>`}<div class="path">${esc(ov.game_dir)}</div></dd>
           </dl>
           <div class="row" style="margin-top: var(--space-4)">
             <button class="btn" id="open-dir">${icon('folder-open')}Open game folder</button>
