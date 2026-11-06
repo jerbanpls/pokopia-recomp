@@ -34,6 +34,42 @@ pub fn zig(tools_dir: &Path) -> PathBuf {
     }
 }
 
+/// A command for a program of this system (Python, tar, Proton, xdg-open). In an AppImage, whose runtime points
+/// variables such as GTK_PATH, GIO_EXTRA_MODULES or XDG_DATA_DIRS into the AppImage for the launcher's own libraries, the
+/// program gets the environment without those entries (and without APPDIR, APPIMAGE, ARGV0, OWD); elsewhere nothing
+/// changes. After tinfoil-chewer/pokopia-recomp-linux (GPL-3.0) launcher/src-tauri/src/linux.rs `host_env`.
+pub fn command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    let mut cmd = Command::new(program);
+    let appdir = std::env::var("APPDIR").unwrap_or_default();
+    let vars = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    for (k, v) in appimage_env_fixes(&appdir, vars) {
+        match v {
+            Some(v) => cmd.env(k, v),
+            None => cmd.env_remove(k),
+        };
+    }
+    cmd
+}
+
+/// What `command` changes for `appdir` (empty: not an AppImage, nothing): (variable, Some(new value) or None = removed).
+fn appimage_env_fixes(appdir: &str, vars: impl Iterator<Item = (String, String)>) -> Vec<(String, Option<String>)> {
+    let appdir = appdir.trim_end_matches('/');
+    if appdir.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (k, v) in vars {
+        if matches!(k.as_str(), "APPDIR" | "APPIMAGE" | "ARGV0" | "OWD") {
+            out.push((k, None));
+        } else if v.contains(appdir) {
+            // a list keeps its other entries; a single path into the AppImage goes
+            let kept: Vec<&str> = v.split(':').filter(|e| !e.is_empty() && !e.contains(appdir)).collect();
+            out.push((k, (v.contains(':') && !kept.is_empty()).then(|| kept.join(":"))));
+        }
+    }
+    out
+}
+
 /// A command that runs the Windows program `exe`: itself on Windows, through `runner` on Linux.
 pub fn windows_program(exe: &Path) -> Result<Command, String> {
     #[cfg(windows)]
@@ -43,7 +79,7 @@ pub fn windows_program(exe: &Path) -> Result<Command, String> {
     #[cfg(not(windows))]
     {
         let r = runner()?;
-        let mut cmd = Command::new(&r.argv[0]);
+        let mut cmd = command(&r.argv[0]);
         cmd.args(&r.argv[1..]).arg(exe);
         for (k, v) in &r.env {
             cmd.env(k, v);
@@ -107,7 +143,7 @@ pub fn free_bytes(dir: &Path) -> Option<u64> {
 /// Opens a file in its default app, a folder in the file manager, or a link in the browser.
 pub fn open(target: &std::ffi::OsStr) -> Result<(), String> {
     let opener = if cfg!(windows) { "explorer.exe" } else { "xdg-open" };
-    let mut child = Command::new(opener).arg(target).spawn().map_err(|e| format!("Could not open {}: {}", target.to_string_lossy(), e))?;
+    let mut child = command(opener).arg(target).spawn().map_err(|e| format!("Could not open {}: {}", target.to_string_lossy(), e))?;
     // reaped, so no exited opener lingers as a zombie while the launcher runs
     std::thread::spawn(move || child.wait());
     Ok(())
@@ -312,7 +348,7 @@ const ZIG: Pinned = Pinned {
 
 /// The Linux Python can run the release's scripts.
 fn python_ready(py: &Path) -> bool {
-    let mut c = Command::new(py);
+    let mut c = command(py);
     c.args(["-I", "-c", "import lz4.block, capstone"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     c.status().map(|s| s.success()).unwrap_or(false)
 }
@@ -354,7 +390,7 @@ pub fn prepare_tools(tools_dir: &Path, cancel: &AtomicBool, report: &mut dyn FnM
     if !py_ok {
         report(total, total, "Installing the Linux build tools: Python...".into());
         unpack(&dl.join(PYTHON.file), &linux, "python")?;
-        let mut cmd = Command::new(&py);
+        let mut cmd = command(&py);
         cmd.args(["-I", "-m", "pip", "install", "-q", "--no-index", "--no-deps", "--no-compile", "--disable-pip-version-check", "--no-warn-script-location"]);
         cmd.args(WHEELS.iter().map(|w| dl.join(w.file)));
         let out = cmd.output().map_err(|e| format!("could not start {}: {}", py.display(), e))?;
@@ -420,7 +456,7 @@ fn unpack(archive: &Path, parent: &Path, name: &str) -> Result<(), String> {
     let tmp = parent.join(format!(".unpack-{}", name));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("cannot create {}: {}", tmp.display(), e))?;
-    let out = Command::new("tar").arg("-xf").arg(archive).arg("-C").arg(&tmp).output().map_err(|e| format!("could not start tar: {}", e))?;
+    let out = command("tar").arg("-xf").arg(archive).arg("-C").arg(&tmp).output().map_err(|e| format!("could not start tar: {}", e))?;
     if !out.status.success() {
         return Err(format!("Unpacking {} failed: {}", archive.display(), String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -438,6 +474,32 @@ fn unpack(archive: &Path, parent: &Path, name: &str) -> Result<(), String> {
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appimage_entries_are_dropped_for_host_programs() {
+        let v = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>().into_iter();
+        let env = v(&[
+            ("APPDIR", "/tmp/.mount_PokoX"),
+            ("APPIMAGE", "/home/me/Games/PokopiaLauncher.AppImage"),
+            ("XDG_DATA_DIRS", "/tmp/.mount_PokoX/usr/share:/usr/local/share:/usr/share"),
+            ("GTK_PATH", "/tmp/.mount_PokoX/usr/lib/gtk-3.0"),
+            ("HOME", "/home/me"),
+            ("PATH", "/usr/bin:/bin"),
+        ]);
+        let mut got = appimage_env_fixes("/tmp/.mount_PokoX/", env);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("APPDIR".to_string(), None),
+                ("APPIMAGE".to_string(), None),
+                ("GTK_PATH".to_string(), None),
+                ("XDG_DATA_DIRS".to_string(), Some("/usr/local/share:/usr/share".to_string())),
+            ]
+        );
+        // not in an AppImage: nothing changes
+        assert!(appimage_env_fixes("", v(&[("XDG_DATA_DIRS", "/usr/share"), ("APPIMAGE", "x")])).is_empty());
+    }
 
     #[test]
     fn win_path_maps_the_root_to_z() {

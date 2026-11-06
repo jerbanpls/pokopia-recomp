@@ -53,7 +53,12 @@ fn load_config(app: &AppHandle) -> Config {
         .unwrap_or_default()
 }
 
+/// The launcher's folder, where `tools/` is. An AppImage runs from a temporary mount: there it is the folder of the
+/// .AppImage file itself ($APPIMAGE, set by the AppImage runtime).
 fn exe_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("APPIMAGE").map(PathBuf::from).and_then(|p| p.parent().map(Path::to_path_buf)) {
+        return dir;
+    }
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."))
 }
 

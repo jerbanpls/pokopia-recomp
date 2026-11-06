@@ -137,7 +137,7 @@ export async function render(el, ctx) {
           <h2>${icon('folder-search')}Dump folder</h2>
           <div class="stack">
             <div class="row">
-              <input type="text" id="path" spellcheck="false" placeholder="C:/path/to/Pokopia_dump" value="${esc(path)}" />
+              <input type="text" id="path" spellcheck="false" placeholder="/home/you/Games/Pokopia_dump" value="${esc(path)}" />
               <button class="btn" id="browse" ${nupBusy ? 'disabled' : ''}>${icon('folder-open')}Browse</button>
               <button class="btn" id="browse-nup" ${nupBusy ? 'disabled' : ''}>${icon('file-archive')}.nup</button>
             </div>

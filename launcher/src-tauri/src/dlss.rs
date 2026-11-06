@@ -6,7 +6,7 @@
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[derive(Serialize, Clone, Default)]
 pub struct Progress {
@@ -54,7 +54,7 @@ pub fn fetch(game_dir: &Path, tools_dir: &Path, mut report: impl FnMut(Progress)
         }
         .into());
     }
-    let mut cmd = Command::new(&py);
+    let mut cmd = crate::host::command(&py);
     cmd.arg("-I").arg(&script).arg("--dir").arg(target_dir(game_dir));
     #[cfg(windows)]
     {

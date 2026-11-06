@@ -87,7 +87,7 @@ pub fn built_state(game_dir: &Path, tools_dir: &Path) -> Built {
     let Ok(tools) = find_tools(tools_dir) else {
         return Built::Stale;
     };
-    let mut cmd = Command::new(&tools.python);
+    let mut cmd = crate::host::command(&tools.python);
     cmd.arg("-I").arg(&tools.script).arg("--check").arg("--game").arg(game_dir);
     quiet(&mut cmd, false);
     let Ok(out) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status() else {
@@ -138,7 +138,7 @@ pub fn run(job: &Job, tools: &Tools, cancel: &AtomicBool, mut report: impl FnMut
     fs::create_dir_all(&build).map_err(|e| format!("cannot create {}: {}", build.display(), e))?;
     let cancel_file = build.join("cancel");
     let _ = fs::remove_file(&cancel_file);
-    let mut cmd = Command::new(&tools.python);
+    let mut cmd = crate::host::command(&tools.python);
     cmd.arg("-I").arg(&tools.script).arg("--exefs").arg(&job.exefs).arg("--game").arg(&job.game_dir);
     cmd.args(["--jobs", &job.jobs.max(1).to_string()]);
     quiet(&mut cmd, job.idle);

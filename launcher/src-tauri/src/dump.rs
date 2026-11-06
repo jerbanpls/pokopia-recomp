@@ -56,7 +56,7 @@ pub fn fwd(p: &Path) -> String {
 /// The build this release supports, from `tools/build/dump_hashes.json` next to the launcher: (main build ID, version text).
 /// None in a dev checkout without the file: then any version passes here and the build script still checks the hashes.
 pub(crate) fn supported() -> Option<(String, String)> {
-    let p = std::env::current_exe().ok()?.parent()?.join("tools").join("build").join("dump_hashes.json");
+    let p = crate::exe_dir().join("tools").join("build").join("dump_hashes.json");
     let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(p).ok()?).ok()?;
     Some((v["main_build_id"].as_str()?.to_lowercase(), v["version"].as_str()?.to_string()))
 }

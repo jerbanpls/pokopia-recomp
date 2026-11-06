@@ -7,7 +7,8 @@ use std::cmp::Ordering;
 use std::io::Read;
 use std::time::Duration;
 
-const REPO: &str = "featureJosh/pokopia-recomp";
+/// The Linux edition's releases, tagged `v<upstream version>-linux.<n>` (v0.5.0-linux.1).
+const REPO: &str = "jerbanpls/pokopia-recomp";
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Builds from a checkout carry these (0.0.0 = untagged build, 0.1.1 = the Cargo.toml default); a tagged release stamps its own.
 const DEV_VERSIONS: [&str; 2] = ["0.0.0", "0.1.1"];
@@ -174,6 +175,15 @@ mod tests {
         assert!(is_newer("0.4.0-beta.1", "0.3.9"));
         assert!(!is_newer("0.4.0-beta.1", "0.4.0-beta.1"));
         assert!(is_newer("0.4.0-beta.1.1", "0.4.0-beta.1"));
+    }
+
+    #[test]
+    fn linux_edition_tags() {
+        assert!(is_newer("v0.5.0-linux.2", "0.5.0-linux.1"));
+        assert!(is_newer("v0.5.0-linux.10", "0.5.0-linux.9"));
+        assert!(is_newer("v0.5.1-linux.1", "0.5.0-linux.3"));
+        assert!(!is_newer("v0.5.0-linux.1", "0.5.0-linux.1"));
+        assert!(!is_dev_version("0.5.0-linux.1"));
     }
 
     #[test]

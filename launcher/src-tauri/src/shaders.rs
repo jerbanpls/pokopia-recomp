@@ -110,7 +110,7 @@ fn quiet(cmd: &mut Command, idle: bool) {
 }
 
 fn python_has_lz4(py: &Path) -> bool {
-    let mut c = Command::new(py);
+    let mut c = crate::host::command(py);
     c.args(["-I", "-c", "import lz4.block"]).stdout(Stdio::null()).stderr(Stdio::null());
     quiet(&mut c, false);
     c.status().map(|s| s.success()).unwrap_or(false)
@@ -414,7 +414,7 @@ pub fn run(job: &Job, tools: &Tools, cancel: &AtomicBool, mut report: impl FnMut
     if !(marker.extracted && all.is_file()) {
         report(p("extract", 0, 0, "Finding the game's shaders in your game files...".into()));
         let _ = fs::remove_file(corpus.join("unique.tsv"));
-        let mut cmd = Command::new(&tools.python);
+        let mut cmd = crate::host::command(&tools.python);
         cmd.arg("-I").arg(&tools.extract).arg("--romfs").arg(&job.romfs).arg("--main").arg(&job.main).arg("--out").arg(&corpus);
         cmd.args(["--jobs", &jobs, "--progress"]);
         let ok = run_tool(cmd, cancel, job.idle, job.log.as_ref(), None, |l| {
